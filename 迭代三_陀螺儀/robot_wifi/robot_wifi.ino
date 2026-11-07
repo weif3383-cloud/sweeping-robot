@@ -19,7 +19,15 @@
     還沒確認過陀螺儀正負號時，第一次轉彎先用編碼器（確認方向後才換陀螺儀）
     轉的方向跟陀螺儀相反時會立刻翻正負號，不會一直轉
 
-  ④ 連家裡 WiFi（同時保留 RobotCar 熱點）
+  ③-2 提前量跟著轉速走（v3）
+    放開後多轉的角度 ≈ 放開那一刻的轉速 × 時間常數 K。學的是 K（秒），
+    所以轉 45°、90°、180° 都準（v2 學固定度數，45° 少轉、180° 多轉）
+
+  ④ 直走鎖方向（v3）
+    出發時記下陀螺儀方向，途中歪了就修：歪 1° → 兩輪差 KH PWM，再加上轉速的阻尼 KHD
+    編碼器同步還在（比重降到 40%），兩個一起用；J1 / J0 開關
+
+  ⑤ 連家裡 WiFi（同時保留 RobotCar 熱點）
     - 把 secrets_example.h 複製成 secrets.h，填入家裡 WiFi 名稱和密碼（secrets.h 不會上傳 GitHub）
     - 沒有 secrets.h 或連不上時，只開 RobotCar 熱點（跟以前一樣）
     - 連上後網址：http://robot.local 或序列埠 / 網頁上顯示的 IP
@@ -116,6 +124,7 @@ const int CORR_MAX = 70;                   // 修正量上限
 const unsigned long CTRL_MS = 20;          // 每 20 ms 修正一次
 float integ = 0;                           // 累積誤差（格·秒）
 long maxErr = 0;                           // 這趟最大左右差（格）
+float maxHead = 0;                         // 這趟直走時最大方向偏差（°）
 unsigned long lastCtrl = 0;
 
 // ---------- 路徑地圖（里程計） ----------
@@ -158,7 +167,14 @@ Preferences prefs;
 bool gyroTurn = false;                     // 這趟轉彎用陀螺儀決定停
 float turnDeg = 0;                         // 要轉幾度（正數）
 int turnDir = 1;                           // +1 右轉、-1 左轉
-float turnLead[2] = {6, 6};                // 提前幾度放開 [右轉, 左轉]（自動學習，存起來）
+float turnK[2] = {0.17f, 0.13f};           // 提前量時間常數（秒）[右轉, 左轉]：提前度數 = K × 放開時轉速（自動學習，存起來）
+float relRate = 0, relLead = 0;            // 這趟放開時的轉速（°/s）和提前度數
+bool headHold = true;                      // 直走鎖方向（J1 / J0）
+float KH = 6;                              // 歪 1° → 修正 6 PWM
+float KHD = 0.4f;                          // 每 1 °/s 轉速 → 再修正 0.4 PWM（阻尼，避免左右扭）
+float KHI = 8;                             // 一直歪 1° 持續 1 秒 → 再多修正 8 PWM（消除固定偏差，例如一邊打滑）
+float hInteg = 0;
+const float ENC_WEIGHT_WITH_GYRO = 0.4f;   // 有陀螺儀時，編碼器同步的比重
 const float TURN_SLOW_DEG = 35;            // 最後幾度開始減速
 const unsigned long TURN_TIMEOUT_MS = 8000;
 unsigned long lastYawMoveMs = 0;
@@ -263,6 +279,7 @@ void report(const char *why) {
   float ed = odoThEnc * 180 / PI - turnEnc0;
   if (ed > 180) ed -= 360; if (ed < -180) ed += 360;
   if (mpuOk) out("  方向變化：陀螺儀 %+.1f°，編碼器推算 %+.1f°", gd, ed);
+  if (mpuOk && !turning) out("  直走鎖方向%s：途中最大偏 %.1f°，停下時偏 %+.1f°", headHold ? "開" : "關", maxHead, gd);
   // 正負號自動判斷：原地轉彎時，陀螺儀轉的方向應該跟下的指令一樣
   if (mpuOk && turning && fabs(gd) > 20) {
     int cmdDir = gdL > 0 ? 1 : -1;         // 左輪前進 = 右轉 = 順時針 = 正
@@ -277,11 +294,11 @@ void report(const char *why) {
   if (gyroTurn && !stalled) {
     float err = gd * turnDir - turnDeg;    // + 是轉過頭
     int k = turnDir > 0 ? 0 : 1;
-    float old = turnLead[k];
-    turnLead[k] = constrain(turnLead[k] + 0.5f * err, 0.0f, 30.0f);
-    prefs.putFloat(k ? "tlL" : "tlR", turnLead[k]);
-    out("  目標 %.0f° → 實際 %.1f°（%+.1f°），%s轉提前量 %.1f → %.1f°",
-        turnDeg, gd * turnDir, err, k ? "左" : "右", old, turnLead[k]);
+    float old = turnK[k];
+    if (relRate > 20) turnK[k] = constrain(turnK[k] + 0.5f * err / relRate, 0.0f, 0.6f);
+    prefs.putFloat(k ? "tkL" : "tkR", turnK[k]);
+    out("  目標 %.0f° → 實際 %.1f°（%+.1f°）；放開時 %.0f °/s、提前 %.1f°；%s轉 K %.3f → %.3f 秒",
+        turnDeg, gd * turnDir, err, relRate, relLead, k ? "左" : "右", old, turnK[k]);
   }
   out("  地圖位置：x %.1f cm，y %.1f cm，方向 %.0f°", odoX / 10, odoY / 10, odoTh * 180 / PI);
   Run &rr = runs[runSeq % RUNN];
@@ -309,7 +326,7 @@ bool busy() { return mode != IDLE || settleWhy != nullptr; }
 void startTimed(int dir) {
   if (busy()) { out("還在跑，先按停止"); return; }
   startL = L.count; startR = R.count;
-  goDir = gdL = gdR = dir; turning = false; integ = 0; maxErr = 0; lastCtrl = millis();
+  goDir = gdL = gdR = dir; turning = false; integ = 0; hInteg = 0; maxErr = 0; maxHead = 0; lastCtrl = millis();
   int s0 = softStop ? min(slowPWM, speed) : speed;
   setLeft(dir * s0); setRight(dir * s0);
   mode = TIMED; moveStart = millis();
@@ -324,7 +341,7 @@ void startTarget(long tgt, int dl, int dr) {
   turning = (dl != dr);
   startL = prevL = L.count; startR = prevR = R.count;
   doneL = doneR = false; stalled = false;
-  integ = 0; maxErr = 0; lastCtrl = millis();
+  integ = 0; hInteg = 0; maxErr = 0; maxHead = 0; lastCtrl = millis();
   lastTickL = lastTickR = millis();
   mode = REVS; moveStart = millis();
   turnYaw0 = yawDeg; turnEnc0 = odoThEnc * 180 / PI;
@@ -355,7 +372,7 @@ void startTurn(float deg) {
   turnDeg = fabs(deg); turnDir = d;
   lastYawMoveMs = millis(); lastYawSeen = yawDeg;
   if (gyroTurn)
-    out("原地%s轉 %.0f°（看陀螺儀，提前 %.1f° 放開）", d > 0 ? "右" : "左", fabs(deg), turnLead[d > 0 ? 0 : 1]);
+    out("原地%s轉 %.0f°（看陀螺儀，提前量 K = %.3f 秒）", d > 0 ? "右" : "左", fabs(deg), turnK[d > 0 ? 0 : 1]);
   else
     out("原地%s轉 %.0f° = 每輪 %ld 格（用編碼器%s）", d > 0 ? "右" : "左", fabs(deg), target,
         mpuOk ? "，這次順便確認陀螺儀方向" : "");
@@ -372,8 +389,9 @@ void runGyroTurn() {
   }
   if (fabs(yawDeg - lastYawSeen) > 1) { lastYawSeen = yawDeg; lastYawMoveMs = millis(); }
   float remain = turnDeg - doneDeg;
-  float lead = turnLead[turnDir > 0 ? 0 : 1];
-  if (remain <= lead) { beginSettle("到達", !softStop); return; }
+  float rateNow = gyroRate * turnDir;      // 目前往目標方向轉的速度（°/s）
+  float lead = max(1.0f, turnK[turnDir > 0 ? 0 : 1] * max(0.0f, rateNow));
+  if (remain <= lead) { relRate = rateNow; relLead = lead; beginSettle("到達", !softStop); return; }
   if (millis() - lastYawMoveMs > STALL_MS) { stalled = true; beginSettle("轉不動（陀螺儀角度沒變），停止", true); return; }
   if (millis() - moveStart > TURN_TIMEOUT_MS) { stalled = true; beginSettle("轉彎逾時，停止", true); return; }
   int lo = min(slowPWM, speed);
@@ -422,14 +440,46 @@ void driveSynced(int baseL, int baseR) {
   if (labs(err) > maxErr) maxErr = labs(err);
   int corr = 0;
   bool both = baseL > 0 && baseR > 0;                     // 兩輪都還在跑才同步
+  bool gyroHold = headHold && mpuOk && useGyro && signChecked && !turning && both;
+  float c = 0;
   if (syncOn && both) {
     float k = (float)DISC_SLOTS / cpr();                  // 40 格模式一格只有一半長，增益減半
     integ = constrain(integ + err * k * dt, -3.0f, 3.0f);
-    corr = constrain((int)lroundf(KP * err * k + KI * integ), -CORR_MAX, CORR_MAX);
+    // 有陀螺儀時：編碼器同步只留比例項、比重 40%（當阻尼用）。
+    // 不留積分項，不然它會堅持「左右格數一樣」，跟陀螺儀「方向不歪」互相拉扯（一邊打滑時兩者要的不一樣）
+    c = gyroHold ? ENC_WEIGHT_WITH_GYRO * KP * err * k : KP * err * k + KI * integ;
   }
+  if (gyroHold) {
+    // 歪向右（順時針，hErr > 0）→ 前進時左輪要慢、右輪要快（corr 往負）；後退時相反
+    float hErr = yawDeg - turnYaw0;
+    if (fabs(hErr) > maxHead) maxHead = fabs(hErr);
+    hInteg = constrain(hInteg + hErr * dt, -5.0f, 5.0f);
+    c -= goDir * (KH * hErr + KHI * hInteg + KHD * gyroRate);
+  }
+  corr = constrain((int)lroundf(c), -CORR_MAX, CORR_MAX);
   baseL = softStart(baseL); baseR = softStart(baseR);
   if (baseL > 0) setLeft(gdL * constrain(baseL + corr, 0, 255));
   if (baseR > 0) setRight(gdR * constrain(baseR - corr, 0, 255));
+}
+
+// 直走鎖方向時：兩輪「平均」走到就一起停（各自停會把修好的方向又拉歪）
+void runStraightHold() {
+  long ml = (L.count - startL) * gdL, mr = (R.count - startR) * gdR;
+  long c = L.count + R.count;
+  if (c != prevL) { prevL = c; lastTickL = lastTickR = millis(); }
+  float moved = (ml + mr) / 2.0f;
+  float lead = (leadL() + leadR()) / 2;
+  if (moved >= max(1.0f, target - lead)) {
+    if (softStop) allOff(); else { brakeLeft(); brakeRight(); }
+    beginSettle("到達", !softStop);
+    return;
+  }
+  if (millis() - lastTickL > STALL_MS) { stalled = true; beginSettle("輪子卡住或沒讀到，停止", true); return; }
+  float remain = target - moved;
+  int lo = min(slowPWM, speed), base;
+  if (softStop) { long zone = sc(RAMP_ZONE); base = remain >= zone ? speed : lo + (int)((speed - lo) * remain / zone); }
+  else base = remain <= sc(slowZone) ? lo : speed;
+  driveSynced(base, base);
 }
 
 void stopNow() {
@@ -580,8 +630,8 @@ void help() {
   out("g3 前進3圈  g-2 後退2圈  w/s 前進/後退2秒  x 停止  +/- 速度  z 歸零  e2 提前量  k 同步  b 停車方式  c20/c40 每圈格數");
   out("t90 右轉90°  t-90 左轉  q3 正方形測試  m 清地圖  D65 輪徑  W204 輪距");
   out("H1/H0 地圖方向用陀螺儀/編碼器  G 陀螺儀正負號反轉  Y 重新量零點  S1.00 陀螺儀比例");
-  out("轉彎：%s（提前量 右 %.1f° 左 %.1f°），輪徑 %.1f mm，輪距 %.1f mm",
-      (mpuOk && useGyro && signChecked) ? "看陀螺儀" : "看編碼器", turnLead[0], turnLead[1], WHEEL_MM, TRACK_MM);
+  out("轉彎：%s（K 右 %.3f 左 %.3f 秒），直走鎖方向：%s，輪徑 %.1f mm，輪距 %.1f mm",
+      (mpuOk && useGyro && signChecked) ? "看陀螺儀" : "看編碼器", turnK[0], turnK[1], headHold ? "開" : "關", WHEEL_MM, TRACK_MM);
   out("一圈 %d 格，%s，同步%s，速度 PWM %d，慢速 PWM %d，提前量 左%.1f 右%.1f",
       cpr(), softStop ? "柔和停車" : "急停", syncOn ? "開" : "關", speed, slowPWM, leadL(), leadR());
 }
@@ -645,6 +695,17 @@ void handle(String cmd) {
       useGyro = cmd.length() > 1 ? cmd.charAt(1) != '0' : !useGyro;
       out("地圖方向來源：%s", (useGyro && mpuOk) ? "陀螺儀" : (useGyro ? "陀螺儀（但 MPU 沒偵測到，暫用編碼器）" : "編碼器"));
       break;
+    case 'K':                              // K6 / K6,8,0.4 = KH, KHI, KHD
+      if (cmd.length() > 1) {
+        String a = cmd.substring(1); int p1 = a.indexOf(','), p2 = p1 >= 0 ? a.indexOf(',', p1 + 1) : -1;
+        KH = a.toFloat();
+        if (p1 >= 0) KHI = a.substring(p1 + 1).toFloat();
+        if (p2 >= 0) KHD = a.substring(p2 + 1).toFloat();
+      }
+      out("鎖方向參數：KH %.1f，KHI %.1f，KHD %.2f", KH, KHI, KHD); break;
+    case 'J':
+      headHold = cmd.length() > 1 ? cmd.charAt(1) != '0' : !headHold;
+      out("直走鎖方向：%s（KH %.1f，KHD %.2f）", headHold ? "開" : "關", KH, KHD); break;
     case 'G':
       gyroSign = -gyroSign; yawDeg = -yawDeg; lastYawOdo = yawDeg; prefs.putFloat("gsign", gyroSign);
       signChecked = 1; prefs.putInt("sok", 1);
@@ -729,6 +790,7 @@ button:active{transform:scale(.97)}
  </div>
  <p class="lbl" style="margin-top:8px">檢查：用手把車子<b>順時針</b>轉，陀螺儀方向應該變大。變小就按「反轉方向」。</p>
  <div class="pair"><button onclick="send('G')">反轉方向</button><button onclick="send('Y')">重新量零點（車子別動）</button></div>
+ <div class="opt"><span>直走鎖方向</span><div class="seg"><button id="j1" onclick="send('J1')">開</button><button id="j0" onclick="send('J0')">關</button></div></div>
  <div class="opt"><span>地圖方向來源</span><div class="seg"><button id="h1" onclick="send('H1')">陀螺儀</button><button id="h0" onclick="send('H0')">編碼器</button></div></div>
  <p class="lbl" id="ipl" style="margin-top:8px"></p>
 </div>
@@ -819,7 +881,7 @@ function poll(){
   $('gst').textContent=d.mpu?(d.zero?'　正常':'　量零點中…'):'　⚠ 沒偵測到，改用編碼器';
   $('gy').textContent=d.mpu?d.yaw.toFixed(1)+'°':'-';$('gr').textContent=d.rate.toFixed(1)+' °/s';
   $('ge').textContent=d.the.toFixed(1)+'°';
-  on('h1',d.hg);on('h0',!d.hg);
+  on('h1',d.hg);on('h0',!d.hg);on('j1',d.hh);on('j0',!d.hh);
   $('ipl').textContent=d.ip?('家裡 WiFi 網址：http://'+d.ip+'　或 http://robot.local'):'目前只有 RobotCar 熱點';
   draw();
  }).catch(()=>{if(++fails>2){$('dot').className='';$('st').textContent='連線中斷，確認手機還連著 RobotCar';}});
@@ -862,7 +924,7 @@ void handleStatus() {
   j += ",\"mid\":" + String(mapId) + ",\"pe\":" + String(pe) +
        ",\"x\":" + String(odoX, 0) + ",\"y\":" + String(odoY, 0) + ",\"th\":" + String(odoTh * 180 / PI, 1) +
        ",\"wd\":" + String(ROBOT_MM, 0) +
-       ",\"mpu\":" + String(mpuOk ? 1 : 0) + ",\"hg\":" + String(useGyro ? 1 : 0) +
+       ",\"mpu\":" + String(mpuOk ? 1 : 0) + ",\"hg\":" + String(useGyro ? 1 : 0) + ",\"hh\":" + String(headHold ? 1 : 0) +
        ",\"yaw\":" + String(yawDeg, 1) + ",\"rate\":" + String(gyroRate, 1) +
        ",\"the\":" + String(odoThEnc * 180 / PI, 1) + ",\"zero\":" + String(zeroed ? 1 : 0) +
        ",\"sok\":" + String(signChecked) +
@@ -886,7 +948,8 @@ void handleData() {
   j += ",\"wheelMM\":" + String(WHEEL_MM, 2) + ",\"trackMM\":" + String(TRACK_MM, 2);
   j += ",\"gyroSign\":" + String(gyroSign, 0) + ",\"gyroScale\":" + String(gyroScale, 4) + ",\"gyroBias\":" + String(gyroBias, 4);
   j += ",\"useGyro\":" + String(useGyro ? 1 : 0) + ",\"signOk\":" + String(signChecked);
-  j += ",\"turnLeadR\":" + String(turnLead[0], 2) + ",\"turnLeadL\":" + String(turnLead[1], 2) + "}";
+  j += ",\"turnKR\":" + String(turnK[0], 3) + ",\"turnKL\":" + String(turnK[1], 3);
+  j += ",\"headHold\":" + String(headHold ? 1 : 0) + ",\"KH\":" + String(KH, 2) + ",\"KHI\":" + String(KHI, 2) + ",\"KHD\":" + String(KHD, 2) + "}";
   j += ",\"state\":{\"mpu\":" + String(mpuOk ? 1 : 0) + ",\"yaw\":" + String(yawDeg, 2) + ",\"encHeading\":" + String(odoThEnc * 180 / PI, 2);
   j += ",\"x\":" + String(odoX, 1) + ",\"y\":" + String(odoY, 1) + ",\"heading\":" + String(odoTh * 180 / PI, 2);
   j += ",\"L\":" + String(L.count) + ",\"R\":" + String(R.count) + ",\"busy\":" + String(busy() ? 1 : 0) + ",\"ms\":" + String(millis()) + "}";
@@ -927,8 +990,8 @@ void setup() {
   gyroSign = prefs.getFloat("gsign", 1.0f);
   gyroScale = prefs.getFloat("gscale", 1.0f);
   signChecked = prefs.getInt("sok", 0);
-  turnLead[0] = prefs.getFloat("tlR", turnLead[0]);
-  turnLead[1] = prefs.getFloat("tlL", turnLead[1]);
+  turnK[0] = prefs.getFloat("tkR", turnK[0]);
+  turnK[1] = prefs.getFloat("tkL", turnK[1]);
   WHEEL_MM = prefs.getFloat("wheel", WHEEL_MM);
   TRACK_MM = prefs.getFloat("track", TRACK_MM);
   mpuOk = initMPU();
@@ -981,6 +1044,8 @@ void loop() {
 
   if (mode == REVS && !settleWhy && gyroTurn) {
     runGyroTurn();
+  } else if (mode == REVS && !settleWhy && !turning && headHold && mpuOk && useGyro && signChecked) {
+    runStraightHold();
   } else if (mode == REVS && !settleWhy) {
     int bL = checkWheel(L, startL, gdL, doneL, lastTickL, prevL, leadL(), brakeLeft, setLeft);
     int bR = checkWheel(R, startR, gdR, doneR, lastTickR, prevR, leadR(), brakeRight, setRight);
