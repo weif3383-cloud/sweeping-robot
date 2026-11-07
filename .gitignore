@@ -1,0 +1,9 @@
+# WiFi 密碼等私人設定，不上傳
+secrets.h
+**/secrets.h
+# 編譯產物
+build/
+*.bin
+*.elf
+__pycache__/
+*.npy
