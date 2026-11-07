@@ -38,6 +38,15 @@
     改學「輪子比例」：鎖方向開著走直線時，看左右各轉了幾格，慢慢算出比例並存起來。
     編碼器同步、地圖距離都用這個比例 → 不靠陀螺儀也比較直。R 查看、R1.000 手動設定
 
+  ⑦ 照地圖修正路線（v6）
+    v5 正方形測試：地圖知道自己歪了，但每一步都是「相對」指令（再走 3 圈、再右轉 90°），誤差一直累積。
+    改成「去地圖上的某一點」：
+      P60,0     走到地圖座標 x 60 cm、y 0 cm（先轉向那一點，再直走過去；每一段都用目前位置重新算）
+      A90       轉到地圖上的 90°（絕對方向，0° = 清地圖時的車頭方向，順時針為正）
+      q2        正方形測試：清地圖後依序走到 4 個角，最後轉回 0°（每邊 2 圈）
+    直走時鎖的是「該走的方向」，不是出發那一刻的方向，所以小偏差也會被慢慢拉回來。
+    每圈格數（c20 / c40）改成存起來，重開機不會變回 20。
+
   ⑥ 無線燒錄（OTA）
     連上家裡 WiFi 後，Arduino IDE「工具 → 連接埠」會多一個網路連接埠「robot at 192.168.x.x」，
     選它就能不插 USB 直接上傳。燒錄開始時馬達會自動停。
@@ -263,6 +272,7 @@ bool turning = false;
 String cmdQ[12];                          // 連續動作（例如正方形測試）
 int qHead = 0, qTail = 0;
 unsigned long nextQ = 0;
+int navRetry = 0;                          // 走到某點時，轉完方向還沒對準的重試次數
 bool doneL = false, doneR = false, stalled = false;
 unsigned long lastTickL = 0, lastTickR = 0;
 long prevL = 0, prevR = 0;
@@ -671,11 +681,46 @@ void enqueue(const String &c) {
   if (n == qHead) return;
   cmdQ[qTail] = c; qTail = n;
 }
+void enqueueFront(const String &c) {       // 插到最前面（下一個就做）
+  int h = (qHead + 11) % 12;
+  if (h == qTail) return;
+  qHead = h; cmdQ[qHead] = c;
+}
+
+float wrap180(float a) { while (a > 180) a -= 360; while (a < -180) a += 360; return a; }
+float headingDeg() { return odoTh * 180 / PI; }   // 地圖上的車頭方向（°，順時針為正）
+
+// 轉到地圖上的絕對方向
+void turnTo(float h) {
+  float d = wrap180(h - headingDeg());
+  if (fabs(d) < 1.5f) { out("方向已經是 %.0f°（差 %.1f°）", h, d); return; }
+  startTurn(d);
+}
+
+// 走到地圖上的某一點（cm）：方向差太多先轉，轉完再回來重新算；方向對了就直走過去並鎖住那個方向
+void gotoPoint(float xcm, float ycm) {
+  float dx = xcm * 10 - odoX, dy = ycm * 10 - odoY;
+  float dist = sqrtf(dx * dx + dy * dy);
+  if (dist < 15) { out("已經在 (%.0f, %.0f) 附近（差 %.1f cm）", xcm, ycm, dist / 10); navRetry = 0; return; }
+  float bearing = atan2f(dx, dy) * 180 / PI;        // 0° = 地圖上方，順時針為正
+  float d = wrap180(bearing - headingDeg());
+  if (fabs(d) > 4 && navRetry < 3) {
+    navRetry++;
+    enqueueFront("P" + String(xcm, 1) + "," + String(ycm, 1));   // 轉完再回來
+    out("前往 (%.0f, %.0f)：先轉 %+.0f°", xcm, ycm, d);
+    startTurn(d);
+    return;
+  }
+  navRetry = 0;
+  startRevs(dist / (PI * WHEEL_MM));
+  turnYaw0 = yawDeg + d;                   // 直走時鎖住「指向目標點」的方向，不是出發那一刻的方向
+  out("  直走 %.1f cm 前往 (%.0f, %.0f)，方向 %.0f°", dist / 10, xcm, ycm, bearing);
+}
 
 void help() {
   out("=== 編碼器 + 走指定圈數（無線版）===");
   out("g3 前進3圈  g-2 後退2圈  w/s 前進/後退2秒  x 停止  +/- 速度  z 歸零  e2 提前量  k 同步  b 停車方式  c20/c40 每圈格數");
-  out("t90 右轉90°  t-90 左轉  q3 正方形測試  m 清地圖  D65 輪徑  W204 輪距");
+  out("t90 右轉90°  t-90 左轉  q2 正方形測試  m 清地圖  P60,0 走到地圖某點  A90 轉到地圖方向  D 輪徑  W 輪距");
   out("H1/H0 地圖方向用陀螺儀/編碼器  G 陀螺儀正負號反轉  Y 重新量零點  S1.00 陀螺儀比例");
   out("轉彎：%s（K 右 %.3f 左 %.3f 秒），直走鎖方向：%s，輪徑 %.1f mm，輪距 %.1f mm",
       (mpuOk && useGyro && signChecked) ? "看陀螺儀" : "看編碼器", turnK[0], turnK[1], headHold ? "開" : "關", WHEEL_MM, TRACK_MM);
@@ -710,6 +755,7 @@ void handle(String cmd) {
         bothEdges = want;
       }
       L.count = R.count = 0; odoL = odoR = 0;
+      prefs.putInt("cpr40", bothEdges ? 1 : 0);
       out("每圈 %d 格（1 格約 %.1f cm），格數歸零，提前量 左%.1f 右%.1f", cpr(), 20.4f / cpr(), leadL(), leadR());
     } break;
     case 'b':
@@ -722,6 +768,15 @@ void handle(String cmd) {
       out("左右同步：%s（KP %.0f，KI %.0f）", syncOn ? "開" : "關", KP, KI);
       break;
     case 't': startTurn(cmd.substring(1).toFloat()); break;
+    case 'P': {                            // P60,30 = 走到地圖座標 (60 cm, 30 cm)
+      if (busy()) { out("還在跑，先按停止"); break; }
+      String a = cmd.substring(1); int k = a.indexOf(',');
+      if (k < 0) { out("格式：P x,y（公分）"); break; }
+      gotoPoint(a.toFloat(), a.substring(k + 1).toFloat());
+    } break;
+    case 'A':                              // A90 = 轉到地圖上的 90°
+      if (busy()) { out("還在跑，先按停止"); break; }
+      turnTo(cmd.substring(1).toFloat()); break;
     case 'm':
       if (busy()) { out("跑的時候不能清地圖"); break; }
       resetMap(); out("地圖清除，位置歸零（車頭方向 = 地圖上方）"); break;
@@ -729,8 +784,11 @@ void handle(String cmd) {
       if (busy()) { out("還在跑，先按停止"); break; }
       float side = cmd.length() > 1 ? cmd.substring(1).toFloat() : 3;
       if (side <= 0) side = 3;
-      for (int i = 0; i < 4; i++) { enqueue("g" + String(side, 2)); enqueue("t90"); }
-      out("正方形測試：每邊 %.2f 圈（約 %.0f cm），右轉 4 次，應該回到起點", side, side * PI * WHEEL_MM / 10);
+      float L = side * PI * WHEEL_MM / 10;  // 邊長（cm）
+      resetMap();
+      enqueue("P0," + String(L, 1)); enqueue("P" + String(L, 1) + "," + String(L, 1));
+      enqueue("P" + String(L, 1) + ",0"); enqueue("P0,0"); enqueue("A0");
+      out("正方形測試（照地圖走）：每邊 %.2f 圈（%.0f cm），依序走到 4 個角再轉回 0°", side, L);
     } break;
     case 'D':
       if (cmd.length() > 1) { WHEEL_MM = constrain(cmd.substring(1).toFloat(), 30.0f, 120.0f); prefs.putFloat("wheel", WHEEL_MM); }
@@ -877,7 +935,7 @@ button:active{transform:scale(.97)}
 </main>
 <script>
 let seq=0, fails=0, mid=-1, ps=0, pts=[], pose={x:0,y:0,th:0}, wide=1, robotW=240;
-function sq(){const v=prompt('正方形每邊幾圈？（3 圈約 61 cm）','3');if(v)send('q'+parseFloat(v));}
+function sq(){const v=prompt('正方形每邊幾圈？（2 圈約 42 cm、3 圈約 63 cm）','2');if(v)send('q'+parseFloat(v));}
 function view(v){wide=v;$('vw').classList.toggle('on',!!v);$('vl').classList.toggle('on',!v);draw();}
 function draw(){
  const c=$('map'),r=c.getBoundingClientRect(),dpr=window.devicePixelRatio||1;
@@ -1050,6 +1108,10 @@ void setup() {
   KH = prefs.getFloat("KH", KH); KHI = prefs.getFloat("KHI", KHI); KHD = prefs.getFloat("KHD", KHD);
   trim[0] = prefs.getFloat("trF", 0); trim[1] = prefs.getFloat("trB", 0);
   wheelRatio = prefs.getFloat("wr", wheelRatio);
+  if (prefs.getInt("cpr40", 1)) {          // 預設 40 格（校準都是用 40 格做的）
+    bothEdges = true;
+    for (int m = 0; m < 2; m++) for (int w = 0; w < 2; w++) leadTab[m][w] *= 2;
+  }
   WHEEL_MM = prefs.getFloat("wheel", WHEEL_MM);
   TRACK_MM = prefs.getFloat("track", TRACK_MM);
   mpuOk = initMPU();
