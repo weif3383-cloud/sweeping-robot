@@ -16,7 +16,7 @@
 - MPU6050：SDA 21、SCL 22，3.3V，位址 0x68
 - HC-SR04：Trig 4、Echo 經 1k/2k 分壓 → 39
 - MOSFET：側刷 13、風扇 25
-- 輪徑 65 mm，有效輪距 199 mm（陀螺儀實測）
+- 有效輪徑 66.9 mm（尺量）、有效輪距 199 mm（陀螺儀實測）、輪子比例 左÷右 1.034
 
 ## Arduino 注意事項（踩過的雷）
 - ESP32 core 3.3.x：`ledcAttach(pin, freq, bits)` / `ledcWrite(pin, duty)`；`timerBegin(hz)` / `timerAttachInterrupt` / `timerAlarm`
@@ -59,4 +59,5 @@
   （v4 時 −3.5～+4.7°、最早 −4.7～−7.1°）。repo 預設已改 1.034（使用者資料夾等下次燒錄時一起寫入）
 - OTA：IDE 顯示 No response from device → 多半是 Windows 防火牆 / 公用網路；已給使用者設定步驟（Claude 不能改系統安全設定）
 - 陀螺儀比例：t360 兩次，陀螺儀 358.5° / 359.0°，使用者目視實際也差約 1° → 比例 1.0 正確，不用改
-- 下一步：D 校正（需捲尺）
+- 輪徑校正：g1.4 三趟，實際 29.6/30.0/28.65 cm vs 計算 28.8/29.1/27.8 → ×1.029 → D 66.9 mm（已用 D 指令存進 ESP32，repo 預設也改了）
+- 下一步：

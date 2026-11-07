@@ -144,7 +144,7 @@ float maxHead = 0;                         // 這趟直走時最大方向偏差�
 unsigned long lastCtrl = 0;
 
 // ---------- 路徑地圖（里程計） ----------
-float WHEEL_MM = 65.0;                     // 輪子直徑（D 指令可改）
+float WHEEL_MM = 66.9;                     // 有效輪徑（2026-11-07 尺量 3 趟：實際 ÷ 計算 = 1.029，D 指令可改，會存起來）
 float TRACK_MM = 199.0;                    // 有效輪距（2026-11-07 用陀螺儀實測 6 次轉彎算出，W 指令可改，會存起來）
 const float ROBOT_MM = 240;                // 機身直徑（地圖上白色路徑的寬度）
 float odoX = 0, odoY = 0, odoTh = 0;       // mm、mm、弧度（0 = 一開始的車頭方向，順時針為正）
