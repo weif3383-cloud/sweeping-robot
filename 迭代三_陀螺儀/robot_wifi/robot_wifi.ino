@@ -32,6 +32,12 @@
     每趟直走結束，看鎖方向平均修正了多少，把其中一半記成「微調」（前進、後退各一個），
     下一趟一開始就先補上。學好以後鎖方向幾乎不用出力，車子不靠陀螺儀也比較直。T 查看、T0 歸零
 
+  ④-3 左右輪大小比例自動學習（v5）
+    v4 實測：微調（PWM）在鎖方向關掉時沒用，因為編碼器同步會堅持「左右格數一樣」，
+    但車子要走直，左輪其實要比右輪多轉約 2.3%（左輪有效直徑比較小或比較會打滑）。
+    改學「輪子比例」：鎖方向開著走直線時，看左右各轉了幾格，慢慢算出比例並存起來。
+    編碼器同步、地圖距離都用這個比例 → 不靠陀螺儀也比較直。R 查看、R1.000 手動設定
+
   ⑥ 無線燒錄（OTA）
     連上家裡 WiFi 後，Arduino IDE「工具 → 連接埠」會多一個網路連接埠「robot at 192.168.x.x」，
     選它就能不插 USB 直接上傳。燒錄開始時馬達會自動停。
@@ -185,6 +191,7 @@ float KH = 14;                             // 歪 1° → 修正 14 PWM（2026-1
 float KHD = 0.7f;                          // 每 1 °/s 轉速 → 再修正 0.7 PWM（阻尼，避免左右扭）
 float KHI = 25;                            // 一直歪 1° 持續 1 秒 → 再多修正 25 PWM（消除固定偏差，例如一邊打滑）
 float hInteg = 0;
+float wheelRatio = 1.023f;                 // 走直線時「左輪格數 ÷ 右輪格數」（2026-11-07 實測 10 趟平均，自動學習，存起來）
 float trim[2] = {0, 0};                    // 直走微調（PWM，正 = 左輪多給、右輪少給）[前進, 後退]（自動學習，存起來）
 double corrSum = 0; long corrN = 0;        // 這趟直走的修正量加總（算平均用）
 const float ENC_WEIGHT_WITH_GYRO = 0.4f;   // 有陀螺儀時，編碼器同步的比重
@@ -304,6 +311,14 @@ void report(const char *why) {
     trim[k] = constrain(trim[k] + 0.5f * (meanC - trim[k]), -40.0f, 40.0f);
     prefs.putFloat(k ? "trB" : "trF", trim[k]);
     out("  直走微調（%s）：平均修正 %+.1f → 微調 %+.1f → %+.1f PWM", k ? "後退" : "前進", meanC, old, trim[k]);
+    // 鎖方向讓車子真的走直了 → 這趟左右格數的比例就是「走直需要的比例」
+    long al = labs(dl), ar = labs(dr);
+    if (fabs(gd) < 3 && al > sc(20) && ar > sc(20)) {
+      float meas = (float)al / ar, oldR = wheelRatio;
+      wheelRatio = constrain(wheelRatio + 0.3f * (meas - wheelRatio), 0.9f, 1.1f);
+      prefs.putFloat("wr", wheelRatio);
+      out("  輪子比例：這趟 %.4f → 比例 %.4f → %.4f", meas, oldR, wheelRatio);
+    }
   }
   // 正負號自動判斷：原地轉彎時，陀螺儀轉的方向應該跟下的指令一樣
   if (mpuOk && turning && fabs(gd) > 20) {
@@ -463,8 +478,9 @@ void driveSynced(int baseL, int baseR) {
   if (now - lastCtrl < CTRL_MS) return;
   float dt = (now - lastCtrl) / 1000.0f;
   lastCtrl = now;
-  long err = (R.count - startR) * gdR - (L.count - startL) * gdL;     // 正 = 右輪跑在前面（走得比較多）
-  if (labs(err) > maxErr) maxErr = labs(err);
+  // 左輪格數先除以比例，換成「等於右輪幾格的距離」再比
+  float err = (R.count - startR) * gdR - (L.count - startL) * gdL / wheelRatio;   // 正 = 右輪跑在前面（走得比較多）
+  if (lroundf(fabs(err)) > maxErr) maxErr = lroundf(fabs(err));
   int corr = 0;
   bool both = baseL > 0 && baseR > 0;                     // 兩輪都還在跑才同步
   bool gyroHold = headHold && mpuOk && useGyro && signChecked && !turning && both;
@@ -498,7 +514,7 @@ void runStraightHold() {
   long ml = (L.count - startL) * gdL, mr = (R.count - startR) * gdR;
   long c = L.count + R.count;
   if (c != prevL) { prevL = c; lastTickL = lastTickR = millis(); }
-  float moved = (ml + mr) / 2.0f;
+  float moved = (ml / sqrtf(wheelRatio) + mr * sqrtf(wheelRatio)) / 2.0f;   // 用比例換算後的平均距離
   float lead = (leadL() + leadR()) / 2;
   if (moved >= max(1.0f, target - lead)) {
     if (softStop) allOff(); else { brakeLeft(); brakeRight(); }
@@ -629,7 +645,7 @@ void updateOdo() {
   }
   odoL = l; odoR = r;
   float mmPer = PI * WHEEL_MM / cpr();
-  float dL = dlc * mmPer, dR = drc * mmPer;
+  float dL = dlc * mmPer / sqrtf(wheelRatio), dR = drc * mmPer * sqrtf(wheelRatio);   // 左輪一格比較短
   float ds = (dL + dR) / 2;                // 中心走了多遠
   float dthEnc = (dL - dR) / TRACK_MM;     // 編碼器推算：左輪走比較多 = 右轉 = 順時針
   odoThEnc += dthEnc;
@@ -735,6 +751,9 @@ void handle(String cmd) {
         prefs.putFloat("KH", KH); prefs.putFloat("KHI", KHI); prefs.putFloat("KHD", KHD);
       }
       out("鎖方向參數：KH %.1f，KHI %.1f，KHD %.2f", KH, KHI, KHD); break;
+    case 'R':
+      if (cmd.length() > 1) { wheelRatio = constrain(cmd.substring(1).toFloat(), 0.9f, 1.1f); prefs.putFloat("wr", wheelRatio); }
+      out("輪子比例（左格數 ÷ 右格數）：%.4f", wheelRatio); break;
     case 'T':
       if (cmd.length() > 1) { trim[0] = trim[1] = cmd.substring(1).toFloat(); prefs.putFloat("trF", trim[0]); prefs.putFloat("trB", trim[1]); }
       out("直走微調：前進 %+.1f、後退 %+.1f PWM（正 = 左輪多給）", trim[0], trim[1]); break;
@@ -985,7 +1004,7 @@ void handleData() {
   j += ",\"useGyro\":" + String(useGyro ? 1 : 0) + ",\"signOk\":" + String(signChecked);
   j += ",\"turnKR\":" + String(turnK[0], 3) + ",\"turnKL\":" + String(turnK[1], 3);
   j += ",\"headHold\":" + String(headHold ? 1 : 0) + ",\"KH\":" + String(KH, 2) + ",\"KHI\":" + String(KHI, 2) + ",\"KHD\":" + String(KHD, 2);
-  j += ",\"trimF\":" + String(trim[0], 2) + ",\"trimB\":" + String(trim[1], 2) + "}";
+  j += ",\"trimF\":" + String(trim[0], 2) + ",\"trimB\":" + String(trim[1], 2) + ",\"wheelRatio\":" + String(wheelRatio, 4) + "}";
   j += ",\"state\":{\"mpu\":" + String(mpuOk ? 1 : 0) + ",\"yaw\":" + String(yawDeg, 2) + ",\"encHeading\":" + String(odoThEnc * 180 / PI, 2);
   j += ",\"x\":" + String(odoX, 1) + ",\"y\":" + String(odoY, 1) + ",\"heading\":" + String(odoTh * 180 / PI, 2);
   j += ",\"L\":" + String(L.count) + ",\"R\":" + String(R.count) + ",\"busy\":" + String(busy() ? 1 : 0) + ",\"ms\":" + String(millis()) + "}";
@@ -1030,6 +1049,7 @@ void setup() {
   turnK[1] = prefs.getFloat("tkL", turnK[1]);
   KH = prefs.getFloat("KH", KH); KHI = prefs.getFloat("KHI", KHI); KHD = prefs.getFloat("KHD", KHD);
   trim[0] = prefs.getFloat("trF", 0); trim[1] = prefs.getFloat("trB", 0);
+  wheelRatio = prefs.getFloat("wr", wheelRatio);
   WHEEL_MM = prefs.getFloat("wheel", WHEEL_MM);
   TRACK_MM = prefs.getFloat("track", TRACK_MM);
   mpuOk = initMPU();
