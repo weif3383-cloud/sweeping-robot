@@ -10,14 +10,17 @@
 | `car_test02/` | 第一版修改 |
 | `encoder_test/` | 編碼器測試（含馬達、抗抖動） |
 | `encoder_read/` | 編碼器讀取 + 走指定圈數（序列埠版） |
-| `encoder_wifi/` | **目前主程式**：無線網頁控制、走圈數、左右同步、柔和停車、路徑地圖 |
+| `encoder_wifi/` | 無線網頁控制、走圈數、左右同步、柔和停車、路徑地圖（沒有 MPU 的穩定版） |
+| `robot_wifi/` | **目前主程式**：encoder_wifi ＋ MPU6050 陀螺儀 ＋ 連家裡 WiFi ＋ `/data` 數據 |
 | `docs/` | 腳位總表 `PINOUT_v2.md` |
 | `cad/` | v2 底盤 STL 與產生腳本（Python） |
 
-## 使用 encoder_wifi
+## 使用 robot_wifi
 
-1. 用 Arduino IDE（ESP32 core 3.x）開 `encoder_wifi/encoder_wifi.ino`，選 NodeMCU-32S 燒錄
-2. 手機連 WiFi `RobotCar`（密碼 `12345678`），打開 http://192.168.4.1
+1. 把 `robot_wifi/secrets_example.h` 複製成 `robot_wifi/secrets.h`，填入家裡 WiFi（2.4 GHz）
+2. 用 Arduino IDE（ESP32 core 3.x）開 `robot_wifi/robot_wifi.ino`，選 NodeMCU-32S 燒錄
+3. 開機後車子靜止 1 秒（陀螺儀量零點）
+4. 家裡 WiFi：http://robot.local（或網頁上顯示的 IP）；熱點：連 `RobotCar`（密碼 `12345678`）開 http://192.168.4.1
 
 ## 注意
 
