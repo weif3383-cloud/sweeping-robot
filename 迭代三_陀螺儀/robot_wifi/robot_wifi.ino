@@ -27,6 +27,10 @@
     出發時記下陀螺儀方向，途中歪了就修：歪 1° → 兩輪差 KH PWM，再加上轉速的阻尼 KHD
     編碼器同步還在（比重降到 40%），兩個一起用；J1 / J0 開關
 
+  ⑥ 無線燒錄（OTA）
+    連上家裡 WiFi 後，Arduino IDE「工具 → 連接埠」會多一個網路連接埠「robot at 192.168.x.x」，
+    選它就能不插 USB 直接上傳。燒錄開始時馬達會自動停。
+
   ⑤ 連家裡 WiFi（同時保留 RobotCar 熱點）
     - 把 secrets_example.h 複製成 secrets.h，填入家裡 WiFi 名稱和密碼（secrets.h 不會上傳 GitHub）
     - 沒有 secrets.h 或連不上時，只開 RobotCar 熱點（跟以前一樣）
@@ -56,6 +60,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include <Wire.h>
 #include <Preferences.h>
 #if __has_include("secrets.h")
@@ -1009,6 +1014,14 @@ void setup() {
   }
   WiFi.softAP(AP_SSID, AP_PASS);
   if (MDNS.begin("robot")) MDNS.addService("http", "tcp", 80);
+  if (home && WiFi.status() == WL_CONNECTED) {
+    ArduinoOTA.setHostname("robot");
+#ifdef OTA_PASS
+    ArduinoOTA.setPassword(OTA_PASS);
+#endif
+    ArduinoOTA.onStart([]() { allOff(); mode = IDLE; settleWhy = nullptr; qHead = qTail = 0; });
+    ArduinoOTA.begin();
+  }
   server.on("/", []() { server.send(200, "text/html; charset=utf-8", PAGE); });
   server.on("/cmd", []() { handle(server.arg("c")); server.send(200, "text/plain", "ok"); });
   server.on("/status", handleStatus);
@@ -1027,6 +1040,7 @@ void setup() {
 }
 
 void loop() {
+  ArduinoOTA.handle();
   server.handleClient();
 
   // 序列埠指令（插 USB 時也能用）
