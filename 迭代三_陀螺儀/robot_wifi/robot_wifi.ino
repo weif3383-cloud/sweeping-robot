@@ -172,12 +172,13 @@ Preferences prefs;
 bool gyroTurn = false;                     // 這趟轉彎用陀螺儀決定停
 float turnDeg = 0;                         // 要轉幾度（正數）
 int turnDir = 1;                           // +1 右轉、-1 左轉
-float turnK[2] = {0.17f, 0.13f};           // 提前量時間常數（秒）[右轉, 左轉]：提前度數 = K × 放開時轉速（自動學習，存起來）
+float turnK[2] = {0.094f, 0.079f};         // 提前量時間常數（秒）[右轉, 左轉]：提前度數 = K × 放開時轉速（自動學習，存起來）
+                                           // 2026-11-07 實車 26 次轉彎學出來：45°/90°/180° 都在 ±1° 內
 float relRate = 0, relLead = 0;            // 這趟放開時的轉速（°/s）和提前度數
 bool headHold = true;                      // 直走鎖方向（J1 / J0）
-float KH = 6;                              // 歪 1° → 修正 6 PWM
-float KHD = 0.4f;                          // 每 1 °/s 轉速 → 再修正 0.4 PWM（阻尼，避免左右扭）
-float KHI = 8;                             // 一直歪 1° 持續 1 秒 → 再多修正 8 PWM（消除固定偏差，例如一邊打滑）
+float KH = 14;                             // 歪 1° → 修正 14 PWM（2026-11-07 實車調：6 → 14）
+float KHD = 0.7f;                          // 每 1 °/s 轉速 → 再修正 0.7 PWM（阻尼，避免左右扭）
+float KHI = 25;                            // 一直歪 1° 持續 1 秒 → 再多修正 25 PWM（消除固定偏差，例如一邊打滑）
 float hInteg = 0;
 const float ENC_WEIGHT_WITH_GYRO = 0.4f;   // 有陀螺儀時，編碼器同步的比重
 const float TURN_SLOW_DEG = 35;            // 最後幾度開始減速
@@ -706,6 +707,7 @@ void handle(String cmd) {
         KH = a.toFloat();
         if (p1 >= 0) KHI = a.substring(p1 + 1).toFloat();
         if (p2 >= 0) KHD = a.substring(p2 + 1).toFloat();
+        prefs.putFloat("KH", KH); prefs.putFloat("KHI", KHI); prefs.putFloat("KHD", KHD);
       }
       out("鎖方向參數：KH %.1f，KHI %.1f，KHD %.2f", KH, KHI, KHD); break;
     case 'J':
@@ -997,6 +999,7 @@ void setup() {
   signChecked = prefs.getInt("sok", 0);
   turnK[0] = prefs.getFloat("tkR", turnK[0]);
   turnK[1] = prefs.getFloat("tkL", turnK[1]);
+  KH = prefs.getFloat("KH", KH); KHI = prefs.getFloat("KHI", KHI); KHD = prefs.getFloat("KHD", KHD);
   WHEEL_MM = prefs.getFloat("wheel", WHEEL_MM);
   TRACK_MM = prefs.getFloat("track", TRACK_MM);
   mpuOk = initMPU();
