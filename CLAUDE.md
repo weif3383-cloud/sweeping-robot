@@ -16,7 +16,7 @@
 - MPU6050：SDA 21、SCL 22，3.3V，位址 0x68
 - HC-SR04：Trig 4、Echo 經 1k/2k 分壓 → 39
 - MOSFET：側刷 13、風扇 25
-- 輪徑 65 mm，輪距約 204 mm（待校正）
+- 輪徑 65 mm，有效輪距 199 mm（陀螺儀實測）
 
 ## Arduino 注意事項（踩過的雷）
 - ESP32 core 3.3.x：`ledcAttach(pin, freq, bits)` / `ledcWrite(pin, duty)`；`timerBegin(hz)` / `timerAttachInterrupt` / `timerAlarm`
@@ -39,5 +39,7 @@
 - robot_wifi（主程式）：MPU6050 階段 ①② 完成（讀取、自動零點、正負號自動判斷、地圖方向用陀螺儀）、
   家裡 WiFi（secrets.h）+ RobotCar 熱點、mDNS robot.local、`/data` JSON（參數、狀態、最近 30 趟紀錄）
 - 讀數據：用內建瀏覽器開 http://robot.local/data（或 IP），電腦要跟機器人在同一個 WiFi
-- 下一步：階段 ③ 轉彎用陀螺儀停、④ 直走鎖方向（陀螺儀 + 編碼器同步一起用，使用者選 A）、
+- 2026-11-07 實測：陀螺儀正負號 −1（已自動存）、零點約 −0.23 °/s；40 格模式轉彎 6 次 → 有效輪距 199 mm
+- 階段 ③ 轉彎用陀螺儀停：已寫好（提前量左右各自學、存 Preferences），待實車測
+- 下一步：④ 直走鎖方向（陀螺儀 + 編碼器同步一起用，使用者選 A）、
   陀螺儀比例校正（原地轉 5 圈）、D/W 校正（正方形測試）
