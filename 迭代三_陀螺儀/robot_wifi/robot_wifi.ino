@@ -27,6 +27,11 @@
     出發時記下陀螺儀方向，途中歪了就修：歪 1° → 兩輪差 KH PWM，再加上轉速的阻尼 KHD
     編碼器同步還在（比重降到 40%），兩個一起用；J1 / J0 開關
 
+  ④-2 直走微調自動學習（v4）
+    車子本身會往一邊偏（實測：左輪比較吃虧，前進往左、後退往右）。
+    每趟直走結束，看鎖方向平均修正了多少，把其中一半記成「微調」（前進、後退各一個），
+    下一趟一開始就先補上。學好以後鎖方向幾乎不用出力，車子不靠陀螺儀也比較直。T 查看、T0 歸零
+
   ⑥ 無線燒錄（OTA）
     連上家裡 WiFi 後，Arduino IDE「工具 → 連接埠」會多一個網路連接埠「robot at 192.168.x.x」，
     選它就能不插 USB 直接上傳。燒錄開始時馬達會自動停。
@@ -180,6 +185,8 @@ float KH = 14;                             // 歪 1° → 修正 14 PWM（2026-1
 float KHD = 0.7f;                          // 每 1 °/s 轉速 → 再修正 0.7 PWM（阻尼，避免左右扭）
 float KHI = 25;                            // 一直歪 1° 持續 1 秒 → 再多修正 25 PWM（消除固定偏差，例如一邊打滑）
 float hInteg = 0;
+float trim[2] = {0, 0};                    // 直走微調（PWM，正 = 左輪多給、右輪少給）[前進, 後退]（自動學習，存起來）
+double corrSum = 0; long corrN = 0;        // 這趟直走的修正量加總（算平均用）
 const float ENC_WEIGHT_WITH_GYRO = 0.4f;   // 有陀螺儀時，編碼器同步的比重
 const float TURN_SLOW_DEG = 35;            // 最後幾度開始減速
 const unsigned long TURN_TIMEOUT_MS = 8000;
@@ -273,8 +280,12 @@ void report(const char *why) {
     long errL = gdL * dl - target, errR = gdR * dr - target;
     out("  目標 %ld 格 → 左差 %+ld 格，右差 %+ld 格（+ 是衝過頭）", target, errL, errR);
     if (!turning && target >= sc(LEARN_MIN_TARGET) && !stalled) {   // 轉彎不拿來學
-      learn(leadL(), errL, "左");
-      learn(leadR(), errR, "右");
+      // 直走是兩輪平均走到一起停，所以用平均誤差學、兩輪提前量保持一樣（各自學會越差越多）
+      long errAvg = lround((errL + errR) / 2.0);
+      float avgLead = (leadL() + leadR()) / 2;
+      leadL() = leadR() = avgLead;
+      learn(leadL(), errAvg, "左");
+      learn(leadR(), errAvg, "右");
     }
   } else {
     long al = labs(dl), ar = labs(dr);
@@ -286,6 +297,14 @@ void report(const char *why) {
   if (ed > 180) ed -= 360; if (ed < -180) ed += 360;
   if (mpuOk) out("  方向變化：陀螺儀 %+.1f°，編碼器推算 %+.1f°", gd, ed);
   if (mpuOk && !turning) out("  直走鎖方向%s：途中最大偏 %.1f°，停下時偏 %+.1f°", headHold ? "開" : "關", maxHead, gd);
+  bool held = headHold && mpuOk && useGyro && signChecked;
+  if (!turning && held && !stalled && corrN > 25) {          // 鎖方向開著、跑超過 0.5 秒才學
+    int k = goDir > 0 ? 0 : 1;
+    float meanC = corrSum / corrN, old = trim[k];
+    trim[k] = constrain(trim[k] + 0.5f * (meanC - trim[k]), -40.0f, 40.0f);
+    prefs.putFloat(k ? "trB" : "trF", trim[k]);
+    out("  直走微調（%s）：平均修正 %+.1f → 微調 %+.1f → %+.1f PWM", k ? "後退" : "前進", meanC, old, trim[k]);
+  }
   // 正負號自動判斷：原地轉彎時，陀螺儀轉的方向應該跟下的指令一樣
   if (mpuOk && turning && fabs(gd) > 20) {
     int cmdDir = gdL > 0 ? 1 : -1;         // 左輪前進 = 右轉 = 順時針 = 正
@@ -333,6 +352,7 @@ void startTimed(int dir) {
   if (busy()) { out("還在跑，先按停止"); return; }
   startL = L.count; startR = R.count;
   goDir = gdL = gdR = dir; turning = false; integ = 0; hInteg = 0; maxErr = 0; maxHead = 0; lastCtrl = millis();
+  corrSum = 0; corrN = 0;
   int s0 = softStop ? min(slowPWM, speed) : speed;
   setLeft(dir * s0); setRight(dir * s0);
   mode = TIMED; moveStart = millis();
@@ -348,6 +368,7 @@ void startTarget(long tgt, int dl, int dr) {
   startL = prevL = L.count; startR = prevR = R.count;
   doneL = doneR = false; stalled = false;
   integ = 0; hInteg = 0; maxErr = 0; maxHead = 0; lastCtrl = millis();
+  corrSum = 0; corrN = 0;
   lastTickL = lastTickR = millis();
   mode = REVS; moveStart = millis();
   turnYaw0 = yawDeg; turnEnc0 = odoThEnc * 180 / PI;
@@ -462,13 +483,17 @@ void driveSynced(int baseL, int baseR) {
     hInteg = constrain(hInteg + hErr * dt, -5.0f, 5.0f);
     c -= goDir * (KH * hErr + KHI * hInteg + KHD * gyroRate);
   }
+  if (!turning && both) {
+    c += trim[goDir > 0 ? 0 : 1];          // 先補上學到的微調
+    if (millis() - moveStart > START_RAMP_MS) { corrSum += c; corrN++; }   // 起步加速後才算平均
+  }
   corr = constrain((int)lroundf(c), -CORR_MAX, CORR_MAX);
   baseL = softStart(baseL); baseR = softStart(baseR);
   if (baseL > 0) setLeft(gdL * constrain(baseL + corr, 0, 255));
   if (baseR > 0) setRight(gdR * constrain(baseR - corr, 0, 255));
 }
 
-// 直走鎖方向時：兩輪「平均」走到就一起停（各自停會把修好的方向又拉歪）
+// 直走：兩輪「平均」走到就一起停（各自停會在最後把車頭扭歪）
 void runStraightHold() {
   long ml = (L.count - startL) * gdL, mr = (R.count - startR) * gdR;
   long c = L.count + R.count;
@@ -710,6 +735,9 @@ void handle(String cmd) {
         prefs.putFloat("KH", KH); prefs.putFloat("KHI", KHI); prefs.putFloat("KHD", KHD);
       }
       out("鎖方向參數：KH %.1f，KHI %.1f，KHD %.2f", KH, KHI, KHD); break;
+    case 'T':
+      if (cmd.length() > 1) { trim[0] = trim[1] = cmd.substring(1).toFloat(); prefs.putFloat("trF", trim[0]); prefs.putFloat("trB", trim[1]); }
+      out("直走微調：前進 %+.1f、後退 %+.1f PWM（正 = 左輪多給）", trim[0], trim[1]); break;
     case 'J':
       headHold = cmd.length() > 1 ? cmd.charAt(1) != '0' : !headHold;
       out("直走鎖方向：%s（KH %.1f，KHD %.2f）", headHold ? "開" : "關", KH, KHD); break;
@@ -956,7 +984,8 @@ void handleData() {
   j += ",\"gyroSign\":" + String(gyroSign, 0) + ",\"gyroScale\":" + String(gyroScale, 4) + ",\"gyroBias\":" + String(gyroBias, 4);
   j += ",\"useGyro\":" + String(useGyro ? 1 : 0) + ",\"signOk\":" + String(signChecked);
   j += ",\"turnKR\":" + String(turnK[0], 3) + ",\"turnKL\":" + String(turnK[1], 3);
-  j += ",\"headHold\":" + String(headHold ? 1 : 0) + ",\"KH\":" + String(KH, 2) + ",\"KHI\":" + String(KHI, 2) + ",\"KHD\":" + String(KHD, 2) + "}";
+  j += ",\"headHold\":" + String(headHold ? 1 : 0) + ",\"KH\":" + String(KH, 2) + ",\"KHI\":" + String(KHI, 2) + ",\"KHD\":" + String(KHD, 2);
+  j += ",\"trimF\":" + String(trim[0], 2) + ",\"trimB\":" + String(trim[1], 2) + "}";
   j += ",\"state\":{\"mpu\":" + String(mpuOk ? 1 : 0) + ",\"yaw\":" + String(yawDeg, 2) + ",\"encHeading\":" + String(odoThEnc * 180 / PI, 2);
   j += ",\"x\":" + String(odoX, 1) + ",\"y\":" + String(odoY, 1) + ",\"heading\":" + String(odoTh * 180 / PI, 2);
   j += ",\"L\":" + String(L.count) + ",\"R\":" + String(R.count) + ",\"busy\":" + String(busy() ? 1 : 0) + ",\"ms\":" + String(millis()) + "}";
@@ -1000,6 +1029,7 @@ void setup() {
   turnK[0] = prefs.getFloat("tkR", turnK[0]);
   turnK[1] = prefs.getFloat("tkL", turnK[1]);
   KH = prefs.getFloat("KH", KH); KHI = prefs.getFloat("KHI", KHI); KHD = prefs.getFloat("KHD", KHD);
+  trim[0] = prefs.getFloat("trF", 0); trim[1] = prefs.getFloat("trB", 0);
   WHEEL_MM = prefs.getFloat("wheel", WHEEL_MM);
   TRACK_MM = prefs.getFloat("track", TRACK_MM);
   mpuOk = initMPU();
@@ -1061,8 +1091,8 @@ void loop() {
 
   if (mode == REVS && !settleWhy && gyroTurn) {
     runGyroTurn();
-  } else if (mode == REVS && !settleWhy && !turning && headHold && mpuOk && useGyro && signChecked) {
-    runStraightHold();
+  } else if (mode == REVS && !settleWhy && !turning) {
+    runStraightHold();                     // 直走一律兩輪平均走到才一起停（各自停會在最後扭一下）
   } else if (mode == REVS && !settleWhy) {
     int bL = checkWheel(L, startL, gdL, doneL, lastTickL, prevL, leadL(), brakeLeft, setLeft);
     int bR = checkWheel(R, startR, gdR, doneR, lastTickR, prevR, leadR(), brakeRight, setRight);
