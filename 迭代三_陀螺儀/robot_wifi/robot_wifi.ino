@@ -191,7 +191,7 @@ float KH = 14;                             // 歪 1° → 修正 14 PWM（2026-1
 float KHD = 0.7f;                          // 每 1 °/s 轉速 → 再修正 0.7 PWM（阻尼，避免左右扭）
 float KHI = 25;                            // 一直歪 1° 持續 1 秒 → 再多修正 25 PWM（消除固定偏差，例如一邊打滑）
 float hInteg = 0;
-float wheelRatio = 1.023f;                 // 走直線時「左輪格數 ÷ 右輪格數」（2026-11-07 實測 10 趟平均，自動學習，存起來）
+float wheelRatio = 1.034f;                 // 走直線時「左輪格數 ÷ 右輪格數」（2026-11-07 v5 實車學到，自動學習，存起來）
 float trim[2] = {0, 0};                    // 直走微調（PWM，正 = 左輪多給、右輪少給）[前進, 後退]（自動學習，存起來）
 double corrSum = 0; long corrN = 0;        // 這趟直走的修正量加總（算平均用）
 const float ENC_WEIGHT_WITH_GYRO = 0.4f;   // 有陀螺儀時，編碼器同步的比重
