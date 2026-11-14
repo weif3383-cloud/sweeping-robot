@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>掃地演算法模擬器（階段 1）</title>
+<style>
+  :root { --bg:#14161a; --panel:#1e2228; --line:#343a44; --text:#e8eaed; --dim:#9aa3af; --accent:#4cc38a; --warn:#f0b429; --bad:#ef6a6a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, "Microsoft JhengHei", "PingFang TC", sans-serif; }
+  main { max-width:1040px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { margin:0 0 14px; color:var(--dim); font-size:13px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; }
+  label { font-size:13px; color:var(--dim); display:flex; align-items:center; gap:6px; }
+  input[type=number] { width:70px; background:#11141a; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 6px; font:inherit; }
+  input[type=range] { width:110px; }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:#2a303a; color:var(--text); cursor:pointer; }
+  button.go { background:var(--accent); color:#06281a; border-color:transparent; font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  .maps { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:760px) { .maps { grid-template-columns:1fr; } }
+  .maps h2 { font-size:14px; margin:0 0 8px; font-weight:600; }
+  .maps small { color:var(--dim); font-weight:400; }
+  canvas { width:100%; aspect-ratio:1; display:block; background:#000; border-radius:8px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(128px, 1fr)); gap:8px; }
+  .stat { background:#11141a; border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .stat b { display:block; font-size:19px; font-variant-numeric:tabular-nums; }
+  .stat span { font-size:12px; color:var(--dim); }
+  #state { font-weight:600; color:var(--accent); }
+  #log { font:12px/1.5 ui-monospace, Consolas, monospace; color:var(--dim); max-height:150px; overflow:auto; white-space:pre-wrap; margin:8px 0 0; }
+  .ok { color:var(--accent); } .no { color:var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>掃地演算法模擬器（階段 1：空場地）</h1>
+  <p class="sub">找角落 → 弓字形一行一行掃 → 沿牆繞一圈 → 走回起點。左邊是真實情況，右邊是機器人「自己以為」的地圖。</p>
+
+  <div class="panel">
+    <div class="row">
+      <button class="go" id="btnStart">開始清掃</button>
+      <button id="btnStop" disabled>停止</button>
+      <button id="btnHome" disabled>回起點</button>
+      <button id="btnReset">重置</button>
+      <label>場地寬 <input type="number" id="inW" value="200" min="80" max="300" step="10"> cm</label>
+      <label>長 <input type="number" id="inH" value="200" min="80" max="300" step="10"> cm</label>
+      <label>亂數 <input type="number" id="inSeed" value="1" min="1" max="9999"></label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label>誤差大小 <input type="range" id="inNoise" min="0" max="3" step="0.5" value="1"> <span id="noiseTxt">1×</span></label>
+      <label>模擬速度 <input type="range" id="inSpeed" min="1" max="40" step="1" value="8"> <span id="speedTxt">8×</span></label>
+      <label><input type="checkbox" id="inCorrect" checked> 碰牆校正座標</label>
+      <label><input type="checkbox" id="inLap" checked> 沿牆繞一圈</label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="margin-bottom:8px"><span>階段：</span><span id="state">待機</span></div>
+    <div class="stats">
+      <div class="stat"><b id="sCov">0%</b><span>覆蓋率（真實）</span></div>
+      <div class="stat"><b id="sTime">0 秒</b><span>經過時間</span></div>
+      <div class="stat"><b id="sDist">0 m</b><span>行走距離</span></div>
+      <div class="stat"><b id="sErr">0 cm</b><span>目前定位誤差</span></div>
+      <div class="stat"><b id="sBump">0</b><span>撞牆次數</span></div>
+      <div class="stat"><b id="sSonar">--</b><span>超音波 / 紅外線 左 右</span></div>
+    </div>
+    <div id="log"></div>
+  </div>
+
+  <div class="maps">
+    <div class="panel"><h2>真實情況 <small>白色＝真的掃過的地方</small></h2><canvas id="cvTrue"></canvas></div>
+    <div class="panel"><h2>機器人的地圖 <small>5 cm 格子；綠線＝量到的牆</small></h2><canvas id="cvBel"></canvas></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+/* =====================================================================
+   第一部分：規劃程式（模擬器和實車共用）
+   ---------------------------------------------------------------------
+   只透過 bot 這個介面跟機器人講話，不知道對面是模擬器還是實車：
+     await bot.setPose({x, y, h})          設定目前座標（可以只給其中幾個）
+     await bot.turnTo(deg)                 原地轉到絕對方向（逆時針為正）
+     await bot.goTo(x, y, {stopAtWall})    走到某點；stopAtWall 時超音波 ≤ 停車距離就停
+                                           回傳 {blocked: true/false}
+     await bot.sense()                     回傳 {x, y, h, sonar(cm 或 null), irL, irR}
+   座標系（找到角落之後）：角落 = (0,0)，牆 A 是 x = 0，牆 B 是 y = 0，
+   場地在 x > 0、y > 0 這一邊。開始時車頭朝 180°（面向牆 A）。
+   ===================================================================== */
+const PLAN_DEFAULTS = {
+  radius: 12,      // 車子半徑 cm
+  stopDist: 8,     // 超音波停車距離 cm
+  lane: 20,        // 行距 cm
+  edge: 2,         // 貼牆走時，車身離牆的距離 cm
+  irRange: 2.5,    // 紅外線偵測得到的距離 cm
+  seg: 40,         // 沿牆時每走這麼遠看一次紅外線 cm
+  correct: true,   // 碰牆時校正座標
+  lap: true        // 弓字形之後沿牆繞一圈
+};
+
+class Aborted extends Error {}
+
+async function cleanRoom(bot, plan, opt) {
+  const c = Object.assign({}, PLAN_DEFAULTS, opt);
+  const R = c.radius, off = R + c.edge, FAR = 1e4;
+  const say = (s) => { plan.state = s; };
+  const log = (s) => { plan.log.push(s); };
+  plan.walls = { xmax: null, ymax: null, origin: false };
+  plan.home = { x: 0, y: 0, h: 180 };
+  plan.lanes = 0;
+
+  // ---- 1. 找角落 ----
+  await bot.setPose({ x: 0, y: 0, h: 180 });
+  say("找角落：往前走到第一面牆");
+  await bot.goTo(-FAR, 0, { stopAtWall: true });
+  let s = await bot.sense();
+  if (s.sonar == null) throw new Error("前面量不到牆（起點要大致正對牆）");
+  plan.home.x += (R + s.sonar) - s.x;
+  await bot.setPose({ x: R + s.sonar });
+
+  say("找角落：左轉，走到第二面牆");
+  await bot.turnTo(-90);
+  s = await bot.sense();
+  await bot.goTo(s.x, s.y - FAR, { stopAtWall: true });
+  s = await bot.sense();
+  if (s.sonar == null) throw new Error("第二面牆量不到");
+  plan.home.y += (R + s.sonar) - s.y;
+  await bot.setPose({ y: R + s.sonar });
+  plan.walls.origin = true;
+  if (plan.onOrigin) plan.onOrigin();
+  log("找到角落，起點在 (" + plan.home.x.toFixed(0) + ", " + plan.home.y.toFixed(0) + ") cm");
+
+  // 在角落先量對面的牆（這時候座標最準）
+  await bot.turnTo(0);
+  s = await bot.sense();
+  if (s.sonar != null) { plan.walls.xmax = s.x + R + s.sonar; log("場地寬度量到 " + plan.walls.xmax.toFixed(0) + " cm"); }
+
+  // ---- 2. 弓字形 ----
+  let laneX = off, dir = +1;
+  await bot.goTo(laneX, s.y, {});                       // 靠到牆 A 旁邊
+  for (let guard = 0; guard < 200; guard++) {
+    plan.lanes++;
+    say("弓字形：第 " + plan.lanes + " 行");
+    await bot.turnTo(dir > 0 ? 90 : -90);
+    s = await bot.sense();
+    if (plan.walls.ymax == null && dir > 0 && s.sonar != null) { plan.walls.ymax = s.y + R + s.sonar; log("場地長度量到 " + plan.walls.ymax.toFixed(0) + " cm"); }
+    const y0 = s.y;
+    await bot.goTo(laneX, dir > 0 ? FAR : -FAR, { stopAtWall: true });
+    s = await bot.sense();
+    const laneLen = Math.abs(s.y - y0);
+    if (s.sonar != null) {
+      if (dir > 0) {
+        if (plan.walls.ymax == null) { plan.walls.ymax = s.y + R + s.sonar; log("場地長度量到 " + plan.walls.ymax.toFixed(0) + " cm"); }
+        else if (c.correct) await bot.setPose({ y: plan.walls.ymax - R - s.sonar });
+      } else if (c.correct) await bot.setPose({ y: R + s.sonar });
+    }
+    // 轉向下一行的方向，順便用超音波量對面的牆
+    await bot.turnTo(0);
+    s = await bot.sense();
+    if (s.sonar != null) {
+      if (plan.walls.xmax == null) { plan.walls.xmax = s.x + R + s.sonar; log("場地寬度量到 " + plan.walls.xmax.toFixed(0) + " cm"); }
+      else if (c.correct) {
+        // 這一行走完，左右偏了多少 → 反推車頭歪了幾度，一起修正
+        const nx = plan.walls.xmax - R - s.sonar, dxErr = nx - s.x;
+        const fix = { x: nx };
+        if (laneLen > 60) fix.h = s.h + Math.max(-5, Math.min(5, 0.7 * (-dir * dxErr / laneLen) * 180 / Math.PI));
+        await bot.setPose(fix);
+      }
+    }
+    s = await bot.sense();
+    if (plan.walls.xmax != null) {
+      const maxX = plan.walls.xmax - off;
+      if (laneX >= maxX - 2) break;                     // 已經貼到對面的牆，掃完了
+      laneX = Math.min(laneX + c.lane, maxX);
+      await bot.goTo(laneX, s.y, {});
+    } else {                                            // 對面太遠還量不到，先橫移一行
+      laneX += c.lane;
+      const r = await bot.goTo(laneX, s.y, { stopAtWall: true });
+      if (r.blocked) { s = await bot.sense(); laneX = s.x; }
+    }
+    dir = -dir;
+  }
+  log("弓字形完成，共 " + plan.lanes + " 行");
+
+  // ---- 3. 沿牆繞一圈（牆在右手邊，用右邊紅外線修正離牆距離）----
+  if (c.lap && plan.walls.xmax != null && plan.walls.ymax != null) {
+    const X = plan.walls.xmax, Y = plan.walls.ymax;
+    const corners = [[off, off], [X - off, off], [X - off, Y - off], [off, Y - off]];
+    s = await bot.sense();
+    let i0 = 0, best = 1e9;
+    corners.forEach((p, i) => { const d = Math.hypot(p[0] - s.x, p[1] - s.y); if (d < best) { best = d; i0 = i; } });
+    say("沿牆：走到最近的角落");
+    await bot.goTo(corners[i0][0], corners[i0][1], { stopAtWall: true });
+    for (let k = 0; k < 4; k++) {
+      const side = (i0 + k) % 4;
+      say("沿牆：第 " + (k + 1) + " / 4 面");
+      const b = corners[(side + 1) % 4];
+      let gapFix = 0, run = 0;                           // 這面牆累積修正了多少、走了多遠 → 反推車頭歪幾度
+      for (let guard = 0; guard < 100; guard++) {
+        s = await bot.sense();
+        const dx = b[0] - s.x, dy = b[1] - s.y;
+        // 這一面牆是沿 x 走（side 0、2）還是沿 y 走（side 1、3）
+        const along = (side % 2 === 0) ? Math.abs(dx) : Math.abs(dy);
+        if (along < 1) break;
+        const step = Math.min(c.seg, along);
+        let tx, ty;
+        if (side === 0) { tx = s.x + step; ty = off; }
+        else if (side === 1) { tx = X - off; ty = s.y + step; }
+        else if (side === 2) { tx = s.x - step; ty = Y - off; }
+        else { tx = off; ty = s.y - step; }
+        const r = await bot.goTo(tx, ty, { stopAtWall: true });
+        s = await bot.sense();
+        if (c.correct) {
+          // 右邊紅外線：亮了代表離牆 ≤ irRange，沒亮代表比較遠
+          const gap = (side === 0) ? s.y - R : (side === 1) ? X - s.x - R : (side === 2) ? Y - s.y - R : s.x - R;
+          let fix = null;
+          if (s.irR && gap > c.irRange) fix = c.edge;
+          else if (!s.irR && gap < c.irRange) fix = c.irRange + 1;
+          run += step;
+          if (fix != null) {
+            gapFix += fix - gap;
+            if (side === 0) await bot.setPose({ y: R + fix });
+            else if (side === 1) await bot.setPose({ x: X - R - fix });
+            else if (side === 2) await bot.setPose({ y: Y - R - fix });
+            else await bot.setPose({ x: R + fix });
+          }
+          // 走到這面牆的盡頭：前面是下一面牆，用超音波校正
+          if (r.blocked && s.sonar != null) {
+            if (side === 0) await bot.setPose({ x: X - R - s.sonar });
+            else if (side === 1) await bot.setPose({ y: Y - R - s.sonar });
+            else if (side === 2) await bot.setPose({ x: R + s.sonar });
+            else await bot.setPose({ y: R + s.sonar });
+            if (run > 100) await bot.setPose({ h: s.h + Math.max(-4, Math.min(4, 0.5 * (gapFix / run) * 180 / Math.PI)) });
+          }
+        }
+        if (r.blocked) break;
+      }
+    }
+    log("沿牆繞完一圈");
+  }
+
+  // ---- 4. 走回起點 ----
+  await goHome(bot, plan);
+}
+
+async function goHome(bot, plan) {
+  plan.state = "走回起點";
+  await bot.goTo(plan.home.x, plan.home.y, { stopAtWall: true });
+  await bot.turnTo(plan.home.h);
+  plan.state = "完成";
+}
+
+/* =====================================================================
+   第二部分：模擬器（假的機器人 + 假的房間）
+   ===================================================================== */
+const D2R = Math.PI / 180;
+const wrap = (a) => { a = (a + 180) % 360; if (a < 0) a += 360; return a - 180; };
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function makeRng(seed) {               // 固定亂數，同一個數字每次結果一樣
+  let a = seed >>> 0;
+  const u = () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const n = () => { let x = 0; while (x === 0) x = u(); return Math.sqrt(-2 * Math.log(x)) * Math.cos(2 * Math.PI * u()); };
+  return { u, n };
+}
+
+class Sim {
+  constructor(o) {
+    this.W = o.W; this.H = o.H; this.noise = o.noise; this.R = 12; this.cleanR = 11;
+    this.dt = 0.02; this.vmax = 20; this.wmax = 90; this.stopDist = 8; this.irRange = 2.5;
+    const g = this.rng = makeRng(o.seed);
+    const n = this.noise;
+    // 起點：隨機位置，車頭大致朝左（面向牆 A），有一點歪
+    this.tx = 40 + g.u() * (this.W - 80); this.ty = 40 + g.u() * (this.H - 80); this.th = 180 + g.n() * 1.5 * n;
+    this.startT = { x: this.tx, y: this.ty, h: this.th };
+    this.ex = 0; this.ey = 0; this.eh = 180;
+    // 這台車固定的誤差
+    this.distScale = 1 + g.n() * 0.010 * n;    // 輪徑誤差（里程計距離）
+    this.gyroScale = 1 + g.n() * 0.003 * n;    // 陀螺儀比例誤差
+    this.gyroBias = g.n() * 0.010 * n;         // 陀螺儀漂移 °/s
+    this.t = 0; this.dist = 0; this.bumps = 0; this.touch = false; this.sonarLast = null; this.sonarT = -1;
+    this.active = null; this.aborted = false;
+    this.cov = new Uint8Array(this.W * this.H); this.covCount = 0; this.lastMark = null;
+    this.trail = [[this.tx, this.ty]];
+    this.bel = new Map(); this.belPath = [];
+    this.mark();
+  }
+  // --- 感測器 ---
+  ray(deg) {                                  // 從車子中心往某方向到牆的距離，以及打到牆的斜度
+    const cx = Math.cos(deg * D2R), cy = Math.sin(deg * D2R);
+    let tX = cx > 1e-9 ? (this.W - this.tx) / cx : cx < -1e-9 ? -this.tx / cx : Infinity;
+    let tY = cy > 1e-9 ? (this.H - this.ty) / cy : cy < -1e-9 ? -this.ty / cy : Infinity;
+    return tX < tY ? { d: tX, inc: Math.acos(Math.abs(cx)) / D2R } : { d: tY, inc: Math.acos(Math.abs(cy)) / D2R };
+  }
+  sonarNow() {                                // 車頭到牆的距離；斜太多或太遠就量不到
+    const r = this.ray(this.th); const d = r.d - this.R;
+    if (r.inc > 25 || d > 300) return null;
+    return Math.max(2, d + this.rng.n() * (0.3 + 0.005 * d) * Math.max(this.noise, 0.2));
+  }
+  sonar() { if (this.t - this.sonarT >= 0.05) { this.sonarT = this.t; this.sonarLast = this.sonarNow(); } return this.sonarLast; }
+  ir(side) { return this.ray(this.th + side * 90).d - this.R <= this.irRange; }   // side +1 左，−1 右
+  // --- 運動 ---
+  move(v, w) {
+    const dt = this.dt, n = this.noise;
+    const dth = w * dt + (v !== 0 ? this.rng.n() * 0.05 * n : 0);       // 地板不平造成的小晃動
+    this.th = wrap(this.th + dth);
+    const ds = v * dt;
+    let nx = this.tx + ds * Math.cos(this.th * D2R), ny = this.ty + ds * Math.sin(this.th * D2R);
+    const cx = clamp(nx, this.R, this.W - this.R), cy = clamp(ny, this.R, this.H - this.R);
+    const hit = (cx !== nx || cy !== ny);
+    if (hit && !this.touch) this.bumps++;
+    this.touch = hit; this.tx = cx; this.ty = cy;
+    // 機器人自己算的位置（有誤差）
+    this.eh = wrap(this.eh + dth * this.gyroScale + this.gyroBias * dt);
+    const es = ds * this.distScale * (1 + this.rng.n() * 0.02 * n);
+    this.ex += es * Math.cos(this.eh * D2R); this.ey += es * Math.sin(this.eh * D2R);
+    this.t += dt; this.dist += Math.abs(ds);
+    if (ds !== 0) this.mark();
+  }
+  mark() {
+    const L = this.lastMark;
+    if (L && Math.hypot(this.tx - L[0], this.ty - L[1]) < 1) return;
+    this.lastMark = [this.tx, this.ty]; this.trail.push([this.tx, this.ty]);
+    const r = this.cleanR, x0 = Math.max(0, Math.floor(this.tx - r)), x1 = Math.min(this.W - 1, Math.ceil(this.tx + r));
+    const y0 = Math.max(0, Math.floor(this.ty - r)), y1 = Math.min(this.H - 1, Math.ceil(this.ty + r));
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const dx = x + 0.5 - this.tx, dy = y + 0.5 - this.ty;
+      if (dx * dx + dy * dy <= r * r) { const i = y * this.W + x; if (!this.cov[i]) { this.cov[i] = 1; this.covCount++; } }
+    }
+    // 機器人自己的 5 cm 格子地圖
+    const bx0 = Math.floor((this.ex - r) / 5), bx1 = Math.floor((this.ex + r) / 5), by0 = Math.floor((this.ey - r) / 5), by1 = Math.floor((this.ey + r) / 5);
+    for (let gy = by0; gy <= by1; gy++) for (let gx = bx0; gx <= bx1; gx++) {
+      const dx = gx * 5 + 2.5 - this.ex, dy = gy * 5 + 2.5 - this.ey;
+      if (dx * dx + dy * dy <= r * r) this.bel.set(gx + "," + gy, 1);
+    }
+    this.belPath.push([this.ex, this.ey]);
+  }
+  coverage() { return this.covCount / (this.W * this.H); }
+  // --- 一步 ---
+  step() {
+    const a = this.active; if (!a) return;
+    if (this.aborted) { this.active = null; a.reject(new Aborted()); return; }
+    if (a.type === "turn") {
+      const err = wrap(a.h - this.eh);
+      if (Math.abs(err) < 0.5) { this.active = null; a.resolve(); return; }
+      this.move(0, Math.sign(err) * clamp(Math.abs(err) * 4, 12, this.wmax));
+    } else if (a.type === "goto") {
+      if (a.phase === 0) {                                  // 先算方向，差太多就先原地轉
+        a.ux = a.x - this.ex; a.uy = a.y - this.ey; const L = Math.hypot(a.ux, a.uy);
+        if (L < 0.5) { this.active = null; a.resolve({ blocked: false }); return; }
+        a.ux /= L; a.uy /= L; a.bearing = Math.atan2(a.uy, a.ux) / D2R; a.v = 0;
+        a.phase = Math.abs(wrap(a.bearing - this.eh)) > 4 ? 1 : 2;
+      }
+      if (a.phase === 1) {
+        const err = wrap(a.bearing - this.eh);
+        if (Math.abs(err) < 0.5) a.phase = 2;
+        else { this.move(0, Math.sign(err) * clamp(Math.abs(err) * 4, 12, this.wmax)); return; }
+      }
+      const rem = (a.x - this.ex) * a.ux + (a.y - this.ey) * a.uy;
+      if (rem <= 0.3) { this.active = null; a.resolve({ blocked: false }); return; }
+      let vt = Math.min(this.vmax, 4 + rem * 2);
+      if (a.stopAtWall) {
+        const s = this.sonar();
+        if (s != null) {
+          if (s <= this.stopDist) { this.active = null; a.resolve({ blocked: true }); return; }
+          if (s < this.stopDist + 15) vt = Math.min(vt, 4 + (s - this.stopDist) * 1.2);
+        }
+      }
+      a.v = Math.min(vt, a.v + 40 * this.dt);
+      const tgt = rem > 8 ? Math.atan2(a.y - this.ey, a.x - this.ex) / D2R : a.bearing;   // 直走鎖「指向目標」的方向
+      this.move(a.v, clamp(wrap(tgt - this.eh) * 3, -40, 40));
+    }
+  }
+  prim(o) { return new Promise((resolve, reject) => { if (this.aborted) return reject(new Aborted()); this.active = Object.assign(o, { resolve, reject }); }); }
+  // --- 給規劃程式用的介面 ---
+  bot() {
+    const S = this;
+    return {
+      async setPose(p) { if (S.aborted) throw new Aborted(); if (p.x != null) S.ex = p.x; if (p.y != null) S.ey = p.y; if (p.h != null) S.eh = p.h; },
+      turnTo(h) { return S.prim({ type: "turn", h }); },
+      goTo(x, y, o) { return S.prim({ type: "goto", x, y, phase: 0, stopAtWall: !!(o && o.stopAtWall) }); },
+      async sense() { if (S.aborted) throw new Aborted(); // 停著量的時候連量 5 次取平均（實車也要這樣做，單次讀值會跳）
+        let sum = 0, k = 0; for (let i = 0; i < 5; i++) { const v = S.sonarNow(); if (v != null) { sum += v; k++; } }
+        return { x: S.ex, y: S.ey, h: S.eh, sonar: k ? sum / k : null, irL: S.ir(+1), irR: S.ir(-1) }; }
+    };
+  }
+}
+
+/* =====================================================================
+   第三部分：畫面
+   ===================================================================== */
+const $ = (id) => document.getElementById(id);
+let sim = null, plan = null, running = false, result = null, rafOn = false;
+
+function newPlan() { return { state: "待機", log: [], walls: { xmax: null, ymax: null, origin: false }, home: { x: 0, y: 0, h: 180 }, lanes: 0 }; }
+function options() { return { W: +$("inW").value, H: +$("inH").value, seed: +$("inSeed").value, noise: +$("inNoise").value }; }
+
+function reset() {
+  if (sim) sim.aborted = true;
+  sim = new Sim(options()); plan = newPlan(); running = false; result = null;
+  plan.onOrigin = () => { sim.bel.clear(); sim.belPath.length = 0; };
+  buttons(); draw();
+}
+function buttons() {
+  $("btnStart").disabled = running; $("btnStop").disabled = !running;
+  $("btnHome").disabled = running || !plan.walls.origin || !!(result && result.done);
+}
+
+async function runJob(job) {
+  running = true; sim.aborted = false; buttons();
+  try { await job(); finish(); }
+  catch (e) { if (e instanceof Aborted) plan.state = "已停止"; else { plan.state = "失敗：" + e.message; plan.log.push("失敗：" + e.message); } }
+  running = false; buttons(); draw();
+}
+function finish() {
+  const s = sim, back = Math.hypot(s.tx - s.startT.x, s.ty - s.startT.y);
+  result = { done: true, coverage: s.coverage(), back, backDeg: wrap(s.th - s.startT.h), time: s.t, dist: s.dist, bumps: s.bumps, lanes: plan.lanes };
+  plan.log.push("完成：覆蓋率 " + (result.coverage * 100).toFixed(1) + "%，回到起點差 " + back.toFixed(1) + " cm、" + result.backDeg.toFixed(1) + "°，" +
+    "花 " + (s.t / 60).toFixed(1) + " 分鐘，走 " + (s.dist / 100).toFixed(1) + " m，撞牆 " + s.bumps + " 次");
+}
+function start() { reset(); const o = { correct: $("inCorrect").checked, lap: $("inLap").checked }; runJob(() => cleanRoom(sim.bot(), plan, o)); loop(); }
+function stop() { if (sim) sim.aborted = true; }
+function home() { runJob(() => goHome(sim.bot(), plan)); loop(); }
+
+function loop() {
+  if (rafOn) return; rafOn = true;
+  const f = () => {
+    const n = +$("inSpeed").value;
+    for (let i = 0; i < n && sim.active; i++) sim.step();
+    if (sim.aborted && sim.active) sim.step();
+    draw();
+    if (running) requestAnimationFrame(f); else rafOn = false;
+  };
+  requestAnimationFrame(f);
+}
+
+function setup(cv) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 400;
+  if (cv.width !== Math.round(w * dpr)) { cv.width = cv.height = Math.round(w * dpr); }
+  const m = 22, span = Math.max(sim.W, sim.H) + 2 * m, k = cv.width / span;
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(k, 0, 0, -k, m * k, cv.height - m * k);        // 單位 cm，y 往上
+  return ctx;
+}
+function robot(ctx, x, y, h, color) {
+  ctx.lineWidth = 1.2; ctx.strokeStyle = color; ctx.fillStyle = "rgba(0,0,0,.35)";
+  ctx.beginPath(); ctx.arc(x, y, 12, 0, 7); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 12 * Math.cos(h * D2R), y + 12 * Math.sin(h * D2R)); ctx.stroke();
+}
+function draw() {
+  const s = sim; if (!s) return;
+  // --- 真實情況 ---
+  let c = setup($("cvTrue"));
+  c.fillStyle = "#181b20"; c.fillRect(0, 0, s.W, s.H);
+  c.save(); c.beginPath(); c.rect(0, 0, s.W, s.H); c.clip();
+  c.strokeStyle = "#e9edf2"; c.lineWidth = s.cleanR * 2; c.lineCap = "round"; c.lineJoin = "round";
+  c.beginPath(); s.trail.forEach((p, i) => i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])); if (s.trail.length === 1) c.lineTo(s.trail[0][0] + 0.01, s.trail[0][1]); c.stroke();
+  c.restore();
+  c.strokeStyle = "#8a93a0"; c.lineWidth = 2; c.strokeRect(0, 0, s.W, s.H);
+  c.fillStyle = "#f0b429"; c.beginPath(); c.arc(s.startT.x, s.startT.y, 3, 0, 7); c.fill();
+  const sn = s.sonarNow();
+  if (sn != null) { c.strokeStyle = "rgba(76,195,138,.7)"; c.lineWidth = 0.8; c.beginPath();
+    c.moveTo(s.tx + 12 * Math.cos(s.th * D2R), s.ty + 12 * Math.sin(s.th * D2R)); c.lineTo(s.tx + (12 + sn) * Math.cos(s.th * D2R), s.ty + (12 + sn) * Math.sin(s.th * D2R)); c.stroke(); }
+  robot(c, s.tx, s.ty, s.th, "#ef6a6a");
+  [+1, -1].forEach((sd) => { c.fillStyle = s.ir(sd) ? "#4cc38a" : "#555c68"; c.beginPath();
+    c.arc(s.tx + 12 * Math.cos((s.th + sd * 90) * D2R), s.ty + 12 * Math.sin((s.th + sd * 90) * D2R), 2.2, 0, 7); c.fill(); });
+  // --- 機器人的地圖 ---
+  c = setup($("cvBel"));
+  c.fillStyle = "#dfe5ec"; s.bel.forEach((v, key) => { const p = key.split(","); c.fillRect(p[0] * 5, p[1] * 5, 5.15, 5.15); });
+  c.strokeStyle = "#3b82f6"; c.lineWidth = 0.8; c.beginPath(); s.belPath.forEach((p, i) => i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])); c.stroke();
+  if (plan.walls.origin) {
+    const X = plan.walls.xmax, Y = plan.walls.ymax, far = Math.max(s.W, s.H) + 10;
+    c.strokeStyle = "#4cc38a"; c.lineWidth = 2; c.beginPath();
+    c.moveTo(0, Y != null ? Y : far); c.lineTo(0, 0); c.lineTo(X != null ? X : far, 0);
+    if (X != null) { c.moveTo(X, 0); c.lineTo(X, Y != null ? Y : far); }
+    if (Y != null) { c.moveTo(0, Y); c.lineTo(X != null ? X : far, Y); }
+    c.stroke();
+    c.fillStyle = "#f0b429"; c.beginPath(); c.arc(plan.home.x, plan.home.y, 3, 0, 7); c.fill();
+  }
+  robot(c, s.ex, s.ey, s.eh, "#3b82f6");
+  // --- 數字 ---
+  $("state").textContent = plan.state;
+  $("sCov").textContent = (s.coverage() * 100).toFixed(1) + "%";
+  $("sTime").textContent = s.t < 90 ? s.t.toFixed(0) + " 秒" : (s.t / 60).toFixed(1) + " 分";
+  $("sDist").textContent = (s.dist / 100).toFixed(1) + " m";
+  $("sErr").textContent = plan.walls.origin ? Math.hypot(s.ex - s.tx, s.ey - s.ty).toFixed(1) + " cm / " + Math.abs(wrap(s.eh - s.th)).toFixed(1) + "°" : "—";
+  $("sBump").textContent = s.bumps;
+  $("sSonar").textContent = (sn == null ? "--" : sn.toFixed(0) + " cm") + " / " + (s.ir(+1) ? "●" : "○") + " " + (s.ir(-1) ? "●" : "○");
+  $("log").textContent = plan.log.join("\n");
+  $("noiseTxt").textContent = $("inNoise").value + "×"; $("speedTxt").textContent = $("inSpeed").value + "×";
+}
+
+$("btnStart").onclick = start; $("btnStop").onclick = stop; $("btnHome").onclick = home; $("btnReset").onclick = reset;
+["inW", "inH", "inSeed", "inNoise"].forEach((id) => $(id).addEventListener("change", () => { if (!running) reset(); }));
+$("inSpeed").addEventListener("input", draw);
+window.addEventListener("resize", draw);
+reset();
+
+/* 給自動測試用：不畫圖，用最快速度跑完一次，回傳結果 */
+window.runFast = async function (o, popt) {
+  const s = new Sim(o), p = newPlan(); let done = false, err = null;
+  cleanRoom(s.bot(), p, popt || {}).then(() => { done = true; }, (e) => { done = true; err = String(e.message || e); });
+  let guard = 0;
+  while (!done && guard++ < 200000) { let n = 0; while (s.active && n++ < 5000) s.step(); await new Promise((r) => setTimeout(r, 0)); if (s.t > 7200) { err = "超過 2 小時"; break; } }
+  return { err, coverage: s.coverage(), back: Math.hypot(s.tx - s.startT.x, s.ty - s.startT.y), backDeg: wrap(s.th - s.startT.h),
+    time: s.t, dist: s.dist, bumps: s.bumps, lanes: p.lanes, xmax: p.walls.xmax, ymax: p.walls.ymax,
+    poseErr: Math.hypot(s.ex - s.tx, s.ey - s.ty), log: p.log };
+};
+</script>
+</body>
+</html>
