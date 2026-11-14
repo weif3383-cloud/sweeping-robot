@@ -47,6 +47,15 @@
     直走時鎖的是「該走的方向」，不是出發那一刻的方向，所以小偏差也會被慢慢拉回來。
     每圈格數（c20 / c40）改成存起來，重開機不會變回 20。
 
+  ⑧ 超音波、紅外線、給掃地演算法用的指令（v7）
+    HC-SR04：每 60 ms 量一次（用中斷量 Echo 寬度，不卡住程式），網頁顯示最近 5 次去掉最大最小的平均
+    紅外線 ×2：只讀 D0（偵測到 / 沒有），I1 = 偵測到時 D0 是 0（多數模組，預設）、I0 = 相反
+      P60,0,1   走到 (60, 0)，途中前方超音波 ≤ 8 cm 就停（回報「被擋住」）；V8 改停車距離
+      O30,12,90 直接設定目前座標 x 30 cm、y 12 cm、方向 90°（掃地演算法碰牆校正用；不想改的欄位空著，例如 O,,90）
+      U         印出超音波與紅外線讀值
+    /status 多回報：son 超音波平均（cm，-1 = 量不到）、sn1 最近一次、irl / irr 紅外線、blk 上一個 P 有沒有被擋住
+    /cmd /status 加上 CORS，電腦上直接開的模擬器網頁也能控制車子
+
   ⑥ 無線燒錄（OTA）
     連上家裡 WiFi 後，Arduino IDE「工具 → 連接埠」會多一個網路連接埠「robot at 192.168.x.x」，
     選它就能不插 USB 直接上傳。燒錄開始時馬達會自動停。
@@ -66,6 +75,8 @@
     HC-020K  VCC→3.3V  GND→GND  左 OUT→GPIO 34  右 OUT→GPIO 35
     L298N    IN1/IN2→GPIO 26/27（右輪）  IN3/IN4→GPIO 32/33（左輪）  ENA/ENB 跳帽插著
     MPU6050  VCC→3.3V  GND→GND  SDA→GPIO 21  SCL→GPIO 22（平放、靠近兩輪中間、貼牢）
+    HC-SR04  VCC→5V  GND→GND  Trig→GPIO 4  Echo→1k/2k 分壓→GPIO 39（Echo 不可以直接接）
+    紅外線   VCC→3.3V  GND→GND  左 D0→GPIO 16  右 D0→GPIO 17（A0 不接）
 
   指令（網頁「自己打指令」或序列埠）
     g3 / g-2   前進 3 圈 / 後退 2 圈        t90 / t-90  原地右轉 / 左轉
@@ -76,6 +87,8 @@
     D65 / W204 輪徑 / 輪距（mm）              H1 / H0     地圖方向用陀螺儀 / 編碼器
     G          陀螺儀正負號反轉               Y           陀螺儀重新量零點（車子要靜止）
     S1.00      陀螺儀比例                     h           說明
+    P60,0,1    走到某點，前方 8 cm 有東西就停  O x,y,h     設定目前座標
+    U          超音波 / 紅外線讀值            V8 / I1 / I0  停車距離 / 紅外線極性
 */
 #include <WiFi.h>
 #include <WebServer.h>
@@ -209,6 +222,27 @@ const unsigned long TURN_TIMEOUT_MS = 8000;
 unsigned long lastYawMoveMs = 0;
 float lastYawSeen = 0;
 
+// ---------- 超音波 HC-SR04 + 紅外線（v7） ----------
+const int TRIG_PIN = 4, ECHO_PIN = 39;     // Echo 經 1k/2k 分壓
+const int IR_L_PIN = 16, IR_R_PIN = 17;    // 紅外線 D0
+bool irActiveLow = true;                   // 偵測到時 D0 = 0（多數模組）；I0 / I1 切換，存起來
+float wallStopCm = 8;                      // P x,y,1：前方剩這麼近就停（V 指令改，存起來）
+const unsigned long SONAR_PERIOD_MS = 60;  // 每 60 ms 量一次（HC-SR04 建議至少隔 60 ms）
+const unsigned long SONAR_MAX_US = 23200;  // 超過 4 m 當作量不到
+const float SONAR_SLOW_CM = 20;            // 前方剩「停車距離 + 20 cm」開始減速
+volatile unsigned long echoRise = 0, echoWidth = 0;
+volatile bool echoHigh = false, echoNew = false;
+bool sonarWaiting = false;
+unsigned long sonarTrigMs = 0;
+const int SONARN = 5;
+float sonarVal[SONARN];                    // 最近 5 次（-1 = 量不到）
+unsigned long sonarMs[SONARN];
+long sonarSeq = 0;                         // 總共量了幾次
+long wallSeenSeq = 0; int wallNear = 0;    // 直走時，連續幾次量到「已經夠近」
+bool wallStop = false;                     // 這趟直走要不要看超音波停
+bool wallHit = false;                      // 這趟是不是被前方擋住停下的
+bool blocked = false;                      // 上一個 P 指令是不是被擋住（給演算法讀）
+
 // ---------- 每趟紀錄（給 /data 讀） ----------
 struct Run {
   char kind;                               // 'g' 走圈數、't' 轉彎、'w' 計時
@@ -236,6 +270,19 @@ void IRAM_ATTR onTimer() {
   sample(R, (in >> (ENC_R - 32)) & 1);
 }
 
+// 超音波 Echo：上升記時間、下降算寬度（GPIO 39 偶爾會被內部拉低 80 ns，太短的脈波丟掉）
+void IRAM_ATTR onEcho() {
+  unsigned long now = micros();
+  bool lvl = (REG_READ(GPIO_IN1_REG) >> (ECHO_PIN - 32)) & 1;
+  if (lvl) { if (!echoHigh) { echoHigh = true; echoRise = now; } }
+  else if (echoHigh) {
+    unsigned long w = now - echoRise;
+    echoHigh = false;
+    if (w < 100) return;                   // 不到 1.7 cm 的脈波：雜訊
+    echoWidth = w; echoNew = true;
+  }
+}
+
 // ---------- 輸出：同時印到序列埠和網頁的紀錄 ----------
 const int LOGN = 40;
 String logs[LOGN];
@@ -247,6 +294,44 @@ void out(const char *fmt, ...) {
   logs[logSeq % LOGN] = buf;
   logSeq++;
 }
+
+// ---------- 超音波 / 紅外線 ----------
+void pushSonar(float cm) {
+  int i = sonarSeq % SONARN;
+  sonarVal[i] = cm; sonarMs[i] = millis();
+  sonarSeq++;
+}
+float sonarLast() { return sonarSeq ? sonarVal[(sonarSeq - 1) % SONARN] : -1; }
+bool sonarFresh() { return sonarSeq && millis() - sonarMs[(sonarSeq - 1) % SONARN] < 200; }
+
+// 最近 5 次（0.5 秒內）去掉最大、最小再平均；有效的不到 3 次就回 -1
+float sonarAvg() {
+  float v[SONARN]; int n = 0;
+  for (int k = 0; k < SONARN && k < sonarSeq; k++) {
+    int i = (sonarSeq - 1 - k) % SONARN;
+    if (sonarVal[i] > 0 && millis() - sonarMs[i] < 500) v[n++] = sonarVal[i];
+  }
+  if (n < 3) return -1;
+  float sum = 0, lo = v[0], hi = v[0];
+  for (int k = 0; k < n; k++) { sum += v[k]; lo = min(lo, v[k]); hi = max(hi, v[k]); }
+  return (sum - lo - hi) / (n - 2);
+}
+
+void updateSonar() {
+  if (echoNew) {
+    unsigned long w = echoWidth; echoNew = false; sonarWaiting = false;
+    pushSonar(w <= SONAR_MAX_US ? w / 58.0f : -1);
+  }
+  unsigned long now = millis();
+  if (now - sonarTrigMs < SONAR_PERIOD_MS) return;
+  if (sonarWaiting) pushSonar(-1);         // 上一次沒有回音
+  echoHigh = false;
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10); digitalWrite(TRIG_PIN, LOW);
+  sonarTrigMs = now; sonarWaiting = true;
+}
+
+bool irLeft()  { return (digitalRead(IR_L_PIN) == LOW) == irActiveLow; }
+bool irRight() { return (digitalRead(IR_R_PIN) == LOW) == irActiveLow; }
 
 // ---------- 馬達 ----------
 void motor(int in1, int in2, int v) {
@@ -296,7 +381,8 @@ void report(const char *why) {
   } else if (mode == REVS) {
     long errL = gdL * dl - target, errR = gdR * dr - target;
     out("  目標 %ld 格 → 左差 %+ld 格，右差 %+ld 格（+ 是衝過頭）", target, errL, errR);
-    if (!turning && target >= sc(LEARN_MIN_TARGET) && !stalled) {   // 轉彎不拿來學
+    if (wallHit) out("  前方有東西提早停下：超音波 %.1f cm（這趟不學提前量）", sonarAvg());
+    if (!turning && target >= sc(LEARN_MIN_TARGET) && !stalled && !wallHit) {   // 轉彎、被擋住的不拿來學
       // 直走是兩輪平均走到一起停，所以用平均誤差學、兩輪提前量保持一樣（各自學會越差越多）
       long errAvg = lround((errL + errR) / 2.0);
       float avgLead = (leadL() + leadR()) / 2;
@@ -360,6 +446,7 @@ void report(const char *why) {
   mode = IDLE;
   turning = false;
   gyroTurn = false;
+  wallStop = false;
 }
 
 // 停車 → 等輪子停穩 → 回報
@@ -391,7 +478,7 @@ void startTarget(long tgt, int dl, int dr) {
   gdL = dl; gdR = dr; goDir = dl;
   turning = (dl != dr);
   startL = prevL = L.count; startR = prevR = R.count;
-  doneL = doneR = false; stalled = false;
+  doneL = doneR = false; stalled = false; wallHit = false; wallNear = 0; wallSeenSeq = sonarSeq;
   integ = 0; hInteg = 0; maxErr = 0; maxHead = 0; lastCtrl = millis();
   corrSum = 0; corrN = 0;
   lastTickL = lastTickR = millis();
@@ -536,6 +623,22 @@ void runStraightHold() {
   int lo = min(slowPWM, speed), base;
   if (softStop) { long zone = sc(RAMP_ZONE); base = remain >= zone ? speed : lo + (int)((speed - lo) * remain / zone); }
   else base = remain <= sc(slowZone) ? lo : speed;
+  if (wallStop && goDir > 0 && sonarFresh()) {
+    float s = sonarLast();
+    if (sonarSeq != wallSeenSeq) {           // 每量到一次新的才判斷
+      wallSeenSeq = sonarSeq;
+      if (s > 0 && s <= wallStopCm + 2.5f) wallNear++; else wallNear = 0;   // 放開後還會滑 1～2 cm，提早一點
+      // 連續兩次夠近才停（一次可能是雜訊）；已經很近就不等
+      if (wallNear >= 2 || (s > 0 && s <= wallStopCm)) {
+        wallHit = true; blocked = true;
+        if (softStop) allOff(); else { brakeLeft(); brakeRight(); }
+        beginSettle("前方有東西，停車", !softStop);
+        return;
+      }
+    }
+    if (s > 0 && s < wallStopCm + SONAR_SLOW_CM)   // 快到牆了：慢下來
+      base = min(base, lo + (int)((speed - lo) * max(0.0f, s - wallStopCm) / SONAR_SLOW_CM));
+  }
   driveSynced(base, base);
 }
 
@@ -698,7 +801,7 @@ void turnTo(float h) {
 }
 
 // 走到地圖上的某一點（cm）：方向差太多先轉，轉完再回來重新算；方向對了就直走過去並鎖住那個方向
-void gotoPoint(float xcm, float ycm) {
+void gotoPoint(float xcm, float ycm, bool stopAtWall) {
   float dx = xcm * 10 - odoX, dy = ycm * 10 - odoY;
   float dist = sqrtf(dx * dx + dy * dy);
   if (dist < 15) { out("已經在 (%.0f, %.0f) 附近（差 %.1f cm）", xcm, ycm, dist / 10); navRetry = 0; return; }
@@ -706,7 +809,7 @@ void gotoPoint(float xcm, float ycm) {
   float d = wrap180(bearing - headingDeg());
   if (fabs(d) > 4 && navRetry < 3) {
     navRetry++;
-    enqueueFront("P" + String(xcm, 1) + "," + String(ycm, 1));   // 轉完再回來
+    enqueueFront("P" + String(xcm, 1) + "," + String(ycm, 1) + (stopAtWall ? ",1" : ""));   // 轉完再回來
     out("前往 (%.0f, %.0f)：先轉 %+.0f°", xcm, ycm, d);
     startTurn(d);
     return;
@@ -714,7 +817,8 @@ void gotoPoint(float xcm, float ycm) {
   navRetry = 0;
   startRevs(dist / (PI * WHEEL_MM));
   turnYaw0 = yawDeg + d;                   // 直走時鎖住「指向目標點」的方向，不是出發那一刻的方向
-  out("  直走 %.1f cm 前往 (%.0f, %.0f)，方向 %.0f°", dist / 10, xcm, ycm, bearing);
+  wallStop = stopAtWall;
+  out("  直走 %.1f cm 前往 (%.0f, %.0f)，方向 %.0f°%s", dist / 10, xcm, ycm, bearing, stopAtWall ? "，前方有東西就停" : "");
 }
 
 void help() {
@@ -722,6 +826,7 @@ void help() {
   out("g3 前進3圈  g-2 後退2圈  w/s 前進/後退2秒  x 停止  +/- 速度  z 歸零  e2 提前量  k 同步  b 停車方式  c20/c40 每圈格數");
   out("t90 右轉90°  t-90 左轉  q2 正方形測試  m 清地圖  P60,0 走到地圖某點  A90 轉到地圖方向  D 輪徑  W 輪距");
   out("H1/H0 地圖方向用陀螺儀/編碼器  G 陀螺儀正負號反轉  Y 重新量零點  S1.00 陀螺儀比例");
+  out("P60,0,1 走到某點、前方 %.0f cm 有東西就停  O x,y,h 設定座標  U 超音波/紅外線  V 停車距離  I1/I0 紅外線極性", wallStopCm);
   out("轉彎：%s（K 右 %.3f 左 %.3f 秒），直走鎖方向：%s，輪徑 %.1f mm，輪距 %.1f mm",
       (mpuOk && useGyro && signChecked) ? "看陀螺儀" : "看編碼器", turnK[0], turnK[1], headHold ? "開" : "關", WHEEL_MM, TRACK_MM);
   out("一圈 %d 格，%s，同步%s，速度 PWM %d，慢速 PWM %d，提前量 左%.1f 右%.1f",
@@ -768,12 +873,45 @@ void handle(String cmd) {
       out("左右同步：%s（KP %.0f，KI %.0f）", syncOn ? "開" : "關", KP, KI);
       break;
     case 't': startTurn(cmd.substring(1).toFloat()); break;
-    case 'P': {                            // P60,30 = 走到地圖座標 (60 cm, 30 cm)
+    case 'P': {                            // P60,30 = 走到地圖座標 (60 cm, 30 cm)；P60,30,1 = 途中前方有東西就停
       if (busy()) { out("還在跑，先按停止"); break; }
       String a = cmd.substring(1); int k = a.indexOf(',');
-      if (k < 0) { out("格式：P x,y（公分）"); break; }
-      gotoPoint(a.toFloat(), a.substring(k + 1).toFloat());
+      if (k < 0) { out("格式：P x,y（公分），或 P x,y,1（前方有東西就停）"); break; }
+      int k2 = a.indexOf(',', k + 1);
+      bool st = k2 >= 0 && a.substring(k2 + 1).toInt() != 0;
+      if (navRetry == 0) blocked = false;  // 新的一個 P（不是轉完回來的那次）
+      gotoPoint(a.toFloat(), a.substring(k + 1).toFloat(), st);
     } break;
+    case 'O': {                            // O30,12,90 = 設定目前座標；空著的欄位不改（O,,90）
+      if (busy()) { out("跑的時候不能改座標"); break; }
+      String a = cmd.substring(1);
+      for (int i = 0; i < 3; i++) {
+        int k = a.indexOf(',');
+        String f = k < 0 ? a : a.substring(0, k);
+        f.trim();
+        if (f.length()) {
+          float v = f.toFloat();
+          if (i == 0) odoX = v * 10;
+          else if (i == 1) odoY = v * 10;
+          else odoTh = wrap180(v) * PI / 180;   // 陀螺儀累積角度不動，只改地圖方向
+        }
+        if (k < 0) break;
+        a = a.substring(k + 1);
+      }
+      addPoint();
+      out("座標設定為 x %.1f cm，y %.1f cm，方向 %.1f°", odoX / 10, odoY / 10, headingDeg());
+    } break;
+    case 'U':
+      out("超音波：最近一次 %.1f cm，平均 %.1f cm（-1 = 量不到）；紅外線：左 %s，右 %s（D0 = %d / %d）",
+          sonarLast(), sonarAvg(), irLeft() ? "偵測到" : "沒有", irRight() ? "偵測到" : "沒有",
+          digitalRead(IR_L_PIN), digitalRead(IR_R_PIN));
+      break;
+    case 'V':
+      if (cmd.length() > 1) { wallStopCm = constrain(cmd.substring(1).toFloat(), 3.0f, 50.0f); prefs.putFloat("wstop", wallStopCm); }
+      out("前方停車距離 %.1f cm（P x,y,1 用）", wallStopCm); break;
+    case 'I':
+      if (cmd.length() > 1) { irActiveLow = cmd.charAt(1) != '0'; prefs.putInt("irlow", irActiveLow ? 1 : 0); }
+      out("紅外線：偵測到時 D0 = %d（I1 = 0、I0 = 1）", irActiveLow ? 0 : 1); break;
     case 'A':                              // A90 = 轉到地圖上的 90°
       if (busy()) { out("還在跑，先按停止"); break; }
       turnTo(cmd.substring(1).toFloat()); break;
@@ -876,6 +1014,11 @@ button:active{transform:scale(.97)}
 </div><div id="st">連線中…</div></div>
 
 <button id="stop" onclick="send('x')">停止</button>
+
+<div class="card"><p class="lbl">感測器</p><div class="cnt">
+ <div><small>超音波（前方）</small><b id="us">-</b><small id="us1">-</small></div>
+ <div><small>紅外線 左　右</small><b id="ir">-</b><small>● = 偵測到</small></div>
+</div></div>
 
 <div class="card">
  <p class="lbl">前進幾圈</p>
@@ -994,6 +1137,8 @@ function poll(){
   $('gy').textContent=d.mpu?d.yaw.toFixed(1)+'°':'-';$('gr').textContent=d.rate.toFixed(1)+' °/s';
   $('ge').textContent=d.the.toFixed(1)+'°';
   on('h1',d.hg);on('h0',!d.hg);on('j1',d.hh);on('j0',!d.hh);
+  $('us').textContent=d.son>=0?d.son.toFixed(1)+' cm':'量不到';$('us1').textContent='最近一次 '+(d.sn1>=0?d.sn1.toFixed(1)+' cm':'量不到')+(d.blk?'　上一段被擋住':'');
+  $('ir').textContent=(d.irl?'●':'○')+'　'+(d.irr?'●':'○');
   $('ipl').textContent=d.ip?('家裡 WiFi 網址：http://'+d.ip+'　或 http://robot.local'):'目前只有 RobotCar 熱點';
   draw();
  }).catch(()=>{if(++fails>2){$('dot').className='';$('st').textContent='連線中斷，確認手機還連著 RobotCar';}});
@@ -1040,6 +1185,9 @@ void handleStatus() {
        ",\"yaw\":" + String(yawDeg, 1) + ",\"rate\":" + String(gyroRate, 1) +
        ",\"the\":" + String(odoThEnc * 180 / PI, 1) + ",\"zero\":" + String(zeroed ? 1 : 0) +
        ",\"sok\":" + String(signChecked) +
+       ",\"son\":" + String(sonarAvg(), 1) + ",\"sn1\":" + String(sonarLast(), 1) +
+       ",\"irl\":" + String(irLeft() ? 1 : 0) + ",\"irr\":" + String(irRight() ? 1 : 0) +
+       ",\"blk\":" + String(blocked ? 1 : 0) + ",\"busy\":" + String(busy() ? 1 : 0) +
        ",\"ip\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("")) + "\"" +
        ",\"p\":[";
   for (long i = ps; i < pe; i++) {
@@ -1047,6 +1195,7 @@ void handleStatus() {
     j += String(pathX[i % PATHN]); j += ','; j += String(pathY[i % PATHN]);
   }
   j += "]}";
+  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", j);
 }
 
@@ -1062,10 +1211,12 @@ void handleData() {
   j += ",\"useGyro\":" + String(useGyro ? 1 : 0) + ",\"signOk\":" + String(signChecked);
   j += ",\"turnKR\":" + String(turnK[0], 3) + ",\"turnKL\":" + String(turnK[1], 3);
   j += ",\"headHold\":" + String(headHold ? 1 : 0) + ",\"KH\":" + String(KH, 2) + ",\"KHI\":" + String(KHI, 2) + ",\"KHD\":" + String(KHD, 2);
-  j += ",\"trimF\":" + String(trim[0], 2) + ",\"trimB\":" + String(trim[1], 2) + ",\"wheelRatio\":" + String(wheelRatio, 4) + "}";
+  j += ",\"trimF\":" + String(trim[0], 2) + ",\"trimB\":" + String(trim[1], 2) + ",\"wheelRatio\":" + String(wheelRatio, 4);
+  j += ",\"wallStopCm\":" + String(wallStopCm, 1) + ",\"irActiveLow\":" + String(irActiveLow ? 1 : 0) + "}";
   j += ",\"state\":{\"mpu\":" + String(mpuOk ? 1 : 0) + ",\"yaw\":" + String(yawDeg, 2) + ",\"encHeading\":" + String(odoThEnc * 180 / PI, 2);
   j += ",\"x\":" + String(odoX, 1) + ",\"y\":" + String(odoY, 1) + ",\"heading\":" + String(odoTh * 180 / PI, 2);
-  j += ",\"L\":" + String(L.count) + ",\"R\":" + String(R.count) + ",\"busy\":" + String(busy() ? 1 : 0) + ",\"ms\":" + String(millis()) + "}";
+  j += ",\"L\":" + String(L.count) + ",\"R\":" + String(R.count) + ",\"busy\":" + String(busy() ? 1 : 0) + ",\"ms\":" + String(millis());
+  j += ",\"sonar\":" + String(sonarAvg(), 1) + ",\"sonarLast\":" + String(sonarLast(), 1) + ",\"irL\":" + String(irLeft() ? 1 : 0) + ",\"irR\":" + String(irRight() ? 1 : 0) + ",\"blocked\":" + String(blocked ? 1 : 0) + "}";
   j += ",\"runs\":[";
   long from = max(0L, runSeq - RUNN);
   for (long i = from; i < runSeq; i++) {
@@ -1093,6 +1244,10 @@ void setup() {
   R.state = digitalRead(ENC_R);
   const int ins[] = {L_IN1, L_IN2, R_IN1, R_IN2};
   for (int p : ins) { ledcAttach(p, 1000, 8); ledcWrite(p, 0); }
+  pinMode(TRIG_PIN, OUTPUT); digitalWrite(TRIG_PIN, LOW);
+  pinMode(ECHO_PIN, INPUT);                 // GPIO 39 只能輸入、沒有內建上拉
+  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), onEcho, CHANGE);
+  pinMode(IR_L_PIN, INPUT); pinMode(IR_R_PIN, INPUT);   // 模組板子上有上拉
 
   timer = timerBegin(1000000);              // 1 MHz
   timerAttachInterrupt(timer, &onTimer);
@@ -1114,6 +1269,8 @@ void setup() {
   }
   WHEEL_MM = prefs.getFloat("wheel", WHEEL_MM);
   TRACK_MM = prefs.getFloat("track", TRACK_MM);
+  wallStopCm = prefs.getFloat("wstop", wallStopCm);
+  irActiveLow = prefs.getInt("irlow", 1) != 0;
   mpuOk = initMPU();
   if (mpuOk) { calibrateGyro(1000); lastGyroUs = micros(); }
 
@@ -1138,7 +1295,7 @@ void setup() {
     ArduinoOTA.begin();
   }
   server.on("/", []() { server.send(200, "text/html; charset=utf-8", PAGE); });
-  server.on("/cmd", []() { handle(server.arg("c")); server.send(200, "text/plain", "ok"); });
+  server.on("/cmd", []() { handle(server.arg("c")); server.sendHeader("Access-Control-Allow-Origin", "*"); server.send(200, "text/plain", "ok"); });
   server.on("/status", handleStatus);
   server.on("/data", handleData);
   server.begin();
@@ -1188,6 +1345,7 @@ void loop() {
 
   updateGyro();
   updateOdo();
+  updateSonar();
 
   if (settleWhy && (long)(millis() - settleUntil) >= 0) {
     const char *why = settleWhy;

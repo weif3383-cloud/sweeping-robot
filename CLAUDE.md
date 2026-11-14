@@ -74,5 +74,9 @@
   超音波朝前 8 cm 停、紅外線側面貼牆、不加保險桿、不買 VL53L0X、場地大小自動量
 - `迭代五_演算法/sweep_sim.html`：階段 1 模擬器完成（規劃程式 `cleanRoom(bot, plan, opt)` 只用 bot 介面
   setPose/turnTo/goTo/sense，之後實車共用）。模擬 2×2 m 覆蓋率平均 93%。測試腳本：無頭瀏覽器呼叫 `window.runFast(o, popt)`
-- 上實車前 robot_wifi 要加：設定座標指令、/status 回報超音波 + 紅外線、P 加超音波停車、超音波 5 次平均
+- robot_wifi v7（2026-11-15）：超音波（Echo 中斷量寬度，60 ms 一次，5 次去頭尾平均）、紅外線（I1/I0 極性）、
+  `P x,y,1` 前方 ≤ wallStopCm（V，預設 8）停並設 blocked、`O x,y,h` 設座標（空欄不改，只改 odoTh 不動 yawDeg）、`U`、
+  /status 加 son/sn1/irl/irr/blk/busy、/cmd /status 加 CORS。被擋住的那趟不學提前量。
+  模擬測試 harness：scratchpad rw_sim8.cpp + stub7（g++，模擬前方牆和 Echo 時序）
+- 韌體座標系：x 往右、y 往一開始的車頭、方向順時針為正（0° = 上）；模擬器 cleanRoom 是數學座標（逆時針為正），接實車時要換算
 - 紅外線 ir_test 已寫好，等使用者接線測試（極性、實際偵測距離未知）
